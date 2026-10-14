@@ -40,14 +40,14 @@ public class Flight : DroneModule
     /// Distance from the center of mass to each motor (meters).
     /// Measured from propeller center positions in our OBJ model.
     /// </summary>
-    private const float armLength = 0.16f;
+    private float armLength = 0.16f;
 
     /// <summary>
     /// armLength / sqrt(2) -- the effective roll/pitch moment arm for an X-configuration.
     /// In an X-quad, motors are at +/-45 deg from the forward axis, so the perpendicular
     /// distance to the roll or pitch axis is L*sin(45) = L/sqrt(2).
     /// </summary>
-    private static readonly float armEffective = armLength * Mathf.Sqrt(2f) / 2f;
+    private float armEffective => this.armLength * Mathf.Sqrt(2f) / 2f;
 
     // --------- Motor / Propeller Model ---------
 
@@ -85,15 +85,15 @@ public class Flight : DroneModule
 
     /// <summary>Moment of inertia about the X axis (pitch). kg*m^2.
     /// Very low for racing-style snap response.</summary>
-    private const float Ixx = 0.003f;
+    private float Ixx = 0.003f;
 
     /// <summary>Moment of inertia about the Y axis (yaw). kg*m^2.
     /// Halved for quick yaw flicks.</summary>
-    private const float Iyy = 0.006f;
+    private float Iyy = 0.006f;
 
     /// <summary>Moment of inertia about the Z axis (roll). kg*m^2.
     /// Very low for racing-style snap response.</summary>
-    private const float Izz = 0.003f;
+    private float Izz = 0.003f;
 
     // --------- Aerodynamic Drag ---------
 
@@ -410,6 +410,11 @@ public class Flight : DroneModule
     /// </summary>
     private Rigidbody rBody;
 
+    // These retain the existing Rigidbody defaults until a custom frame supplies values.
+    private Vector3 customCenterOfMass = Vector3.zero;
+    private Quaternion customInertiaRotation = Quaternion.identity;
+    private float customMass = 0f; // 0 = keep the prefab's Rigidbody mass
+
     /// <summary>
     /// Motor yaw torque sign for each motor.
     /// CW motors produce positive yaw reaction torque, CCW produce negative.
@@ -449,6 +454,22 @@ public class Flight : DroneModule
         base.Awake();
     }
 
+    /// <summary>
+    /// Applies mass properties calculated for a custom drone frame before Start configures
+    /// the Rigidbody.
+    /// </summary>
+    public void ApplyCustomMassProperties(Vector3 com, Vector3 principalMoments,
+        Quaternion inertiaRotation, float newArmLength, float totalMassKg)
+    {
+        this.customMass = totalMassKg;
+        this.Ixx = principalMoments.x;
+        this.Iyy = principalMoments.y;
+        this.Izz = principalMoments.z;
+        this.armLength = newArmLength;
+        this.customCenterOfMass = com;
+        this.customInertiaRotation = inertiaRotation;
+    }
+
     private void Start()
     {
         // === Configure Rigidbody for accurate physics ===
@@ -456,20 +477,26 @@ public class Flight : DroneModule
         this.rBody.linearDamping = 0f;
         this.rBody.angularDamping = 0.02f;
 
-        // Explicitly set center of mass at the transform origin.
+        // Mass first: the inertia tensor below is absolute and must not be rescaled by it.
+        if (this.customMass > 0f)
+            this.rBody.mass = this.customMass;
+
+        // Explicitly set center of mass (the transform origin by default).
         // Without this, Unity computes CoM from the collider shape, which can
         // be offset and causes the drone to behave as if its CoG shifts with tilt.
-        this.rBody.centerOfMass = Vector3.zero;
+        this.rBody.centerOfMass = this.customCenterOfMass;
 
         // Set the inertia tensor so Unity correctly computes the rigid-body
         // gyroscopic term (w x Iw) in Euler's rotation equations.
         this.rBody.inertiaTensor = new Vector3(Ixx, Iyy, Izz);
-        this.rBody.inertiaTensorRotation = Quaternion.identity;
+        this.rBody.inertiaTensorRotation = this.customInertiaRotation;
 
         this.rBody.constraints = RigidbodyConstraints.None;
         this.rBody.maxAngularVelocity = maxAngularVelocity * 2f;
         this.rBody.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
         this.rBody.interpolation = RigidbodyInterpolation.Interpolate;
+
+        Debug.Log($"[Flight] Applied to rigidbody: mass={this.rBody.mass:F4} centerOfMass={this.rBody.centerOfMass:F4} inertiaTensor={this.rBody.inertiaTensor:F6} inertiaTensorRotation={this.rBody.inertiaTensorRotation} armLength={this.armLength:F4} armEffective={this.armEffective:F4}");
 
         // Initialize target altitude and ground reference
         TargetAltitude = this.transform.position.y;

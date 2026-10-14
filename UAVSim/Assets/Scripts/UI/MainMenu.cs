@@ -133,6 +133,21 @@ public class MainMenu : MonoBehaviour
     }
 
     /// <summary>
+    /// Shows the custom drone STL import screen.
+    /// </summary>
+    public void ShowCustomDroneBuilder()
+    {
+        if (this.customDroneImportPane != null)
+        {
+            this.customDroneImportPane.gameObject.SetActive(true);
+        }
+        else
+        {
+            Debug.LogError("ImportPageUI was not found in MainMenu hierarchy.");
+        }
+    }
+
+    /// <summary>
     /// Handles when the user selects a new value in the level collection dropdown.
     /// </summary>
     /// <remarks>This overload exists to be called from Unity, since Unity cannot call functions with multiple parameters.</remarks>
@@ -312,6 +327,11 @@ public class MainMenu : MonoBehaviour
     private NoUsernameUI usernamePane;
 
     /// <summary>
+    /// The screen which lets the user import a custom drone STL.
+    /// </summary>
+    private ImportPageUI customDroneImportPane;
+
+    /// <summary>
     /// The index of the next key in the Konami Code which the user must press.
     /// </summary>
     private int konamiCodeIndex = 0;
@@ -324,6 +344,9 @@ public class MainMenu : MonoBehaviour
         this.settingsPane = this.GetComponentInChildren<SettingsUI>();
         this.bestTimesPane = this.GetComponentInChildren<BestTimesUI>();
         this.usernamePane = this.GetComponentInChildren<NoUsernameUI>();
+        // Include inactive objects so the pane is still found once Start() has hidden it (and on
+        // any later reload where it was saved hidden) - the default search skips inactive objects.
+        this.customDroneImportPane = this.GetComponentInChildren<ImportPageUI>(true);
 
         if (LevelInfo.WinableLevels.Count != SavedDataManager.Data.BestTimes.Length)
         {
@@ -340,6 +363,11 @@ public class MainMenu : MonoBehaviour
         this.settingsPane.gameObject.SetActive(false);
         this.bestTimesPane.gameObject.SetActive(false);
         this.usernamePane.gameObject.SetActive(false);
+
+        if (this.customDroneImportPane != null)
+        {
+            this.customDroneImportPane.gameObject.SetActive(false);
+        }
 
         this.numDrones.SetActive(false);
 
