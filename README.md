@@ -103,7 +103,7 @@ Run this check after changing the drone prefab, the flight code, or the custom-f
 **2. Imported model**
 
 1. Open the import panel and wait for **Mass service: ready** under the status text. The panel starts the bundled service itself (run `tools/build-mass-service.ps1` once first so the bundle exists). If it shows **Mass service: failed**, the reason is shown there and in the Console, and the service log is `mass-service.log` in `Application.persistentDataPath`.
-2. On the main menu, import an `.stl`, enter the density and the six node rows, then press **Begin**.
+2. On the same panel, load an `.stl`, enter the density, and fill the node rows in the scrolling table below them. Press **Build Drone**, then **Back**, then **Begin** on the main menu.
 3. Check that **your frame is shown and the stock body is hidden**. If you see both overlapping, or only the stock drone, check the Console (see below).
 4. Use the zoom bar to fit the whole frame on screen. Nothing should be clipped or too small to inspect.
 5. Check that **each propeller sits on a motor position** of your frame, not where the stock drone's propellers were.

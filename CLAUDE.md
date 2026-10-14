@@ -12,22 +12,22 @@ A student can **import their own drone frame (`.stl`) into UAVSim and fly it**. 
 
 1. On the main menu, the student opens the import panel (the custom drone page). A **Preset Drone config** dropdown at the top lists saved presets.
 2. They browse to an `.stl` and enter a material density (kg/m³), or pick a preset from the dropdown, which fills in the path, density and node rows. Any filled value can still be edited.
-3. They enter position and mass for the six fixed node rows: 4 motors, battery, flight controller / companion computer. Positions are in the CAD file's Z-up frame, in metres.
-4. The panel validates, stores the statics, and closes back to the menu.
-4a. **Save as preset:** the student can save the current STL path, density and six node rows under a name. The preset is written to disk and appears in the dropdown next time, including in later sessions.
+3. On the same panel, below the STL and density, they enter type, position and mass for each node (4 motors plus any battery, flight controller and companion computer) in a scrolling table. It starts with 6 rows; **+ Add Row** / **- Remove Row** change that between 4 and 12. Positions are in the CAD file's Z-up frame, in metres.
+4. **Build Drone** validates the STL, density and rows together and stores the statics; **Back** closes the panel to the menu.
+4a. **Save as preset:** the student can save the current STL path, density and shown node rows (however many there are) under a name. The preset is written to disk and appears in the dropdown next time, including in later sessions.
 5. They press **Begin**. The flight scene loads, the default drone is replaced with their mesh, the `Rigidbody` gets the computed COM / principal inertia / arm length, and the propellers move to the motor positions.
 6. The drone hovers stably at sensible throttle and responds to roll/pitch/yaw the way its mass distribution predicts.
 7. On any failure (service down, bad STL, invalid layout) it logs a clear reason and falls back to the default drone. It never crashes or flies a broken model.
 
 ### Definition of done
 
-- [ ] Custom-drone path reaches flight from the main menu with no Editor tricks (blocked today: nothing closes the import panel).
+- [ ] Custom-drone path reaches flight from the main menu with no Editor tricks. (No longer blocked: Back is wired to `ImportPageUI.Close`. On 2026-10-13, an Editor run calling Build Drone, then `Close()`, then `BeginSimulation()` flew the 100 mm cube with the expected values. Still to do: click through it by hand.)
 - [ ] `DebugFrameTestSetup` / `TestSetup` removed; the normal gameplay route no longer touches custom-frame statics.
 - [ ] Mass sanity check passes: a known-volume cube at known density matches hand arithmetic for mass, COM and inertia.
 - [ ] A symmetric X-quad with correct inputs hovers without drift or climb; `Flight.cs` audited against the unbalanced/climbing symptom.
 - [ ] `mass_composer.py` / `udp_listener.py` are in version control and reviewed, or their location is documented and pinned. (Location is now documented under Architecture: the MassCompose repo. Still open: their current changes are uncommitted, and nothing pins a version.)
 - [ ] Default (non-custom) drone and all existing lab modules behave exactly as before.
-- [ ] Saving a preset writes its STL path, density and six node rows to disk; after restarting Unity the preset shows in the **Preset Drone config** dropdown.
+- [ ] Saving a preset writes its STL path, density and shown node rows (4–12) to disk; after restarting Unity the preset shows in the **Preset Drone config** dropdown.
 - [ ] Selecting a preset fills the path, density and node rows exactly as they were saved, and Begin then flies it through the same path as a hand-entered import.
 - [ ] A preset whose STL file is missing or moved fails with a clear message in the panel and does not crash; the student can still re-browse and resave.
 
@@ -61,11 +61,11 @@ A student can **import their own drone frame (`.stl`) into UAVSim and fly it**. 
 - `Drone/PropellerSpin.cs` — propeller visuals; `SetPropellerPositions(Vector3[])` accepts FL/FR/BL/BR.
 - `Drone/DebugFrameTestSetup.cs` — temporary test harness, see Known cruft.
 - `Drone/MotorQuadrants.cs` — shared FL/FR/BL/BR contract. `Classify` mirrors the loader's comparison; `TryValidateMotorLayout` is the single validator used by both the UI and `Awake()`.
-- `UI/ImportPageUI.cs` — hand-built import panel: browse for STL, density entry, validation, writes `SelectedSTLPath` / `SelectedDensity`. Will also host the **Preset Drone config** dropdown and the Save-as-preset button (planned).
+- `UI/ImportPageUI.cs` — the single hand-built custom drone panel (`CustomDroneImportPanel`): browse for STL, density entry, and the **Build Drone** button (`OnBuildDroneClicked`), which checks the STL exists and the density, calls `NodePlacementUI.TryStoreNodes`, and only then writes `SelectedSTLPath` / `SelectedDensity`. Will also host the **Preset Drone config** dropdown and the Save-as-preset button (planned).
 - `Drone/MassServiceLauncher.cs` — static class, creates no GameObjects. `EnsureRunning()` probes port 5070 and, if nothing answers, starts the bundled `python.exe` and polls until it is ready. It kills only the process it started, on `Application.quitting`. `Current` exposes the state for the UI.
 - `Editor/MassServiceBuildStep.cs` — `IPostprocessBuildWithReport`; copies `Assets/MassService~` into a Windows player's `StreamingAssets/MassService`.
 - `Drone/DronePresetStore.cs` — planned. Reads and writes the preset file (see Drone presets). Pure data, no UI; the import panel calls it.
-- `UI/NodePlacementUI.cs` — binds the hand-built six-row node panel; parses typed values, validates, writes `SelectedNodes`. Does not launch the sim.
+- `UI/NodePlacementUI.cs` — on the same GameObject as `ImportPageUI`. Binds the node rows (12 hand-built under `All Nodes`, `Node00`–`Node11`), the Add/Remove Row buttons and the paste box, all inside the `NodeScroll` scroll view. Parses the shown rows (hidden rows are ignored), validates, and writes `SelectedNodes` in `TryStoreNodes()`. Does not launch the sim. (Merged from a separate `NodePlacementPanel` on 2026-10-13.)
 - `UI/MainMenu.cs` — menu; `BeginSimulation()` loads the flight scene. Finds and shows/hides the import panel.
 - `UI/CustomDroneBuilderUI.cs` — ORPHANED, do not revive. See Hard constraint.
 - `UI/DronePreviewOrbit.cs` — orbit/click-raycast helper for a mesh preview. Currently unused; out of MVP scope.
@@ -145,11 +145,11 @@ Full public surface of `CustomFrameLoader` — everything else is `private`:
 
 Downstream public methods: `Flight.ApplyCustomMassProperties(Vector3 com, Vector3 principalMoments, Quaternion inertiaRotation, float newArmLength)` (`Flight.cs:460`); `PropellerSpin.SetPropellerPositions(Vector3[])` (`PropellerSpin.cs:97`).
 
-**Neither UI page starts the simulation.** `ImportPageUI` stores path + density and opens the node panel; `NodePlacementUI.OnBuildDroneClicked` stores `SelectedNodes` and stops. The only route to flight is the `Begin` button in `Main.unity` (GameObject `936562977`), wired directly to `MainMenu.BeginSimulation` (`MainMenu.cs:69`), which calls `SceneManager.LoadScene` at `:106`.
+**The custom drone panel does not start the simulation.** Build Drone (`ImportPageUI.OnBuildDroneClicked`) stores `SelectedNodes` via `NodePlacementUI.TryStoreNodes`, then path + density, and stops. The only route to flight is the `Begin` button in `Main.unity` (GameObject `936562977`), wired directly to `MainMenu.BeginSimulation` (`MainMenu.cs:69`), which calls `SceneManager.LoadScene` at `:106`.
 
 `Awake()` validates the motor layout via `MotorQuadrants.TryValidateMotorLayout` before any socket traffic (`CustomFrameLoader.cs:57-67`) and falls back to the default drone on failure. The pipeline is therefore **quadcopter-only**: exactly 4 motors, one per quadrant. This makes `RepositionPropellers`' own duplicate/missing checks (`:114`, `:121`) unreachable in practice.
 
-**Pattern to copy:** `NodePlacementUI.OnBuildDroneClicked` — clear `SelectedNodes`, add each node with its position **verbatim** (already CAD Z-up metres, no conversion), then stop. Do NOT copy `CustomDroneBuilderUI.OnConfirmClicked`: it converts via `ConvertYUpToZUp` (correct only for points picked off a Y-up preview mesh, which no longer exists) and ends in `BeginSimulation()`.
+**Pattern to copy:** `NodePlacementUI.TryStoreNodes` — clear `SelectedNodes`, add each node with its position **verbatim** (already CAD Z-up metres, no conversion), then stop. Do NOT copy `CustomDroneBuilderUI.OnConfirmClicked`: it converts via `ConvertYUpToZUp` (correct only for points picked off a Y-up preview mesh, which no longer exists) and ends in `BeginSimulation()`.
 
 **Modification policy for `CustomFrameLoader.cs`:** treat as change-by-approval only. It is the whole import pipeline and the only implementation of the wire protocol, so edits carry protocol risk. Ask before editing; do not refactor it opportunistically. The wire protocol itself is LOCKED regardless (see above).
 
@@ -215,8 +215,8 @@ UAVSim/Assets/MassService~/            tilde = ignored by the Unity importer (no
 
 `Drone/MassServiceLauncher.cs` (static class, creates no UI). `CustomFrameLoader` and the wire protocol are untouched.
 
-- `EnsureRunning()` is idempotent and called from `ImportPageUI.OnEnable()`. `OnEnable` also fires on a Back round trip from the node page, hence the idempotency. The service only starts when the custom path is used, so default-drone students never pay for it. The probe, spawn and wait run on a background thread; `ImportPageUI.Update()` polls `MassServiceLauncher.Current.version` and redraws.
-- **Status display:** `ImportPageUI.statusText` holds two lines: the page's own message (set via `SetStatus`) and `Mass service: starting... / ready / <failure reason>`. Every page message goes through `SetStatus` so neither line overwrites the other. Not yet checked: whether the hand-built text box is tall enough for two lines.
+- `EnsureRunning()` is idempotent and called from `ImportPageUI.OnEnable()`. `OnEnable` fires every time the panel is reopened, hence the idempotency. The service only starts when the custom path is used, so default-drone students never pay for it. The probe, spawn and wait run on a background thread; `ImportPageUI.Update()` polls `MassServiceLauncher.Current.version` and redraws.
+- **Status display:** `ImportPageUI.statusText` holds two lines: the page's own message (set via `SetStatus`) and `Mass service: starting... / ready / <failure reason>`. Every page message goes through `SetStatus` so neither line overwrites the other. Since the merge the box is 32 px tall, and both lines showed in a 2026-10-13 Play-mode screenshot. Node validation messages go to a separate `Node Info Text`, at the bottom left beside Build Drone.
 - **Paths:** `ResolveServiceRoot()` returns `Application.dataPath/MassService~` in the Editor and `Application.streamingAssetsPath/MassService` in a player.
 - **Launch command:** `python\python.exe -u "<...>\udp_listener.py" --parent-pid <Unity pid>`. `-u` keeps the log unbuffered; `--parent-pid` is the crash protection (decided: parent-PID watch, not an idle timeout or Job Object).
 - **Probe before spawn.** Send a 1-byte datagram whose value is not 40 to `127.0.0.1:5070`. The service answers any non-40 header with a 255 error packet (verified), so any reply means "already running". No reply within about 300 ms, or a connection-reset exception from the closed port, means "down".
@@ -247,11 +247,15 @@ UAVSim/Assets/MassService~/            tilde = ignored by the Unity importer (no
 
 ## Current MVP scope
 
-Node placement panel: **six fixed rows, typed numeric entry, hand-built in the Editor.** The script binds to existing GameObjects and reads typed values.
+Node entry: **typed numeric rows, hand-built in the Editor**, on the same panel as the STL and density. The rows, the Add/Remove Row buttons and the paste box sit in a `ScrollRect` (`NodeScroll`, built in the Editor), so the panel fits a 16:9 screen (800 × 450 canvas). Column headers stay pinned above it. The script binds to existing GameObjects and reads typed values.
+
+**Add / remove rows (built 2026-10-13):** all 12 rows exist in the scene (`Node00`–`Node11`), and 6 are shown at start. **+ Add Row** shows the first hidden row, blank. **- Remove Row** clears and hides the last shown row. Clearing means a re-added row never brings back old values. Rows can go from 4 up to the 12 that exist; the minimum of 4 is the quad-only motor count (`NodePlacementUI.MinShownRows`). **To raise the cap, duplicate rows in the Editor**, keeping the stripes alternating; never `Instantiate` rows from code. The paste box resizes the shown rows to the pasted line count (minimum 4) and rejects more than 12. `Content` uses a `VerticalLayoutGroup` + `ContentSizeFitter`, so the scroll range follows the shown rows with no layout code. Each part has a `LayoutElement` with a fixed height, except `All Nodes`, whose own layout group gives its height.
+
+Verified in Play mode on 2026-10-13: the 4 and 12 limits hold; a re-added row is blank; pasting 9, 3 or 13 lines gave 9 rows, 4 rows, and an error. A 7-node build (4 motors, battery, FC, offboard computer) with the 100 mm cube flew at 1.750 kg, and the COM matched hand arithmetic: CAD (0, −0.00171, −0.00229) m.
 
 ### Drone presets (in scope)
 
-A preset is a saved copy of one import: the STL path, the density, and the six node rows (type, x, y, z, massKg, all in the CAD Z-up frame, metres). It is a convenience for re-running the same import. It is not a new kind of drone.
+A preset is a saved copy of one import: the STL path, the density, and the shown node rows, 4 to 12 of them (type, x, y, z, massKg, all in the CAD Z-up frame, metres). It is a convenience for re-running the same import. It is not a new kind of drone.
 
 - **Storage:** one JSON file in `Application.persistentDataPath` (for example `drone_presets.json`). It holds a list of named presets. Writes replace the whole file. Reads and writes are wrapped in try/catch, and a corrupt file logs a reason and gives an empty list.
 - **Save:** the Save-as-preset button validates the current layout with `MotorQuadrants.TryValidateMotorLayout` before writing, so an invalid layout cannot be saved. Saving under an existing name overwrites that preset.
@@ -264,7 +268,7 @@ A preset is a saved copy of one import: the STL path, the density, and the six n
 **EXPLICITLY NOT BUILDING — do not add, do not suggest:**
 - mesh preview, preview camera, `RenderTexture`, `MeshCollider`
 - click-to-place, raycasting
-- add/remove row logic, marker objects, scroll list
+- add/remove rows by creating or destroying row objects from code, marker objects. (Add/remove by showing and hiding the 12 hand-built rows IS built; see above.)
 - non-quadcopter layouts (hex, octo, plus-configuration)
 - fixing the CAD↔Unity mirror for chiral frames (deferred; see Open questions)
 
@@ -287,7 +291,6 @@ A preset is a saved copy of one import: the STL path, the density, and the six n
 ## Open questions (unresolved — do not assume answered)
 
 - `Flight.cs` has **never been audited.** A NaN `armLength` reaching `Flight.cs:50` `armEffective` would give a NaN moment arm — no attitude authority while still climbing. That hole is now closed at `CustomFrameLoader.cs:201` (`!IsFinite(armLength)`), but whether it ever fired historically is unknowable: before the fix it passed silently with no log.
-- **Nothing closes the import panel.** No UnityEvent in `Main.unity` calls `ImportPageUI.Close` and no `SetActive(false)` targets the panel. It is fullscreen and raycast-blocking, so opening it hides the `Begin` button with no way back. The custom-drone path cannot currently reach flight. Fix is Editor-only: wire a button to `ImportPageUI.Close`.
 - `mass_composer.py` and `udp_listener.py` have **never been code-reviewed** — and are not in this repo; they live in the MassCompose repo (see Architecture).
 - The mirror (see Coordinate conventions): harmless on a symmetric X-quad, wrong on chiral geometry. **Deferred, not fixed.**
 - No end-to-end mass sanity check has been run — e.g. a known-volume cube at known density versus hand arithmetic.
@@ -358,7 +361,7 @@ Run this check after changing the drone prefab, the flight code, or the custom-f
 **2. Imported model**
 
 1. Open the import panel and wait for **Mass service: ready** under the status text. The panel starts the bundled service itself (run `tools/build-mass-service.ps1` once first so the bundle exists). If it shows **Mass service: failed**, the reason is shown there and in the Console, and the service log is `mass-service.log` in `Application.persistentDataPath`.
-2. On the main menu, import an `.stl`, enter the density and the six node rows, then press **Begin**.
+2. On the same panel, load an `.stl`, enter the density, and fill the node rows in the scrolling table below them. Press **Build Drone**, then **Back**, then **Begin** on the main menu.
 3. Check that **your frame is shown and the stock body is hidden**. If you see both overlapping, or only the stock drone, check the Console (see below).
 4. Use the zoom bar to fit the whole frame on screen. Nothing should be clipped or too small to inspect.
 5. Check that **each propeller sits on a motor position** of your frame, not where the stock drone's propellers were.
@@ -382,13 +385,10 @@ With the Console open during Play:
 - UDP request/response, validation, mesh swap, propeller repositioning — `CustomFrameLoader.cs`
 - Layout guard + `armLength` finiteness check — `CustomFrameLoader.cs:57-67`, `:201`
 - Shared quadrant contract — `MotorQuadrants.cs`
-- Import panel and node placement panel — `ImportPageUI.cs`, `NodePlacementUI.cs`
-
-**Blocked**
-- Custom-drone path cannot reach flight: no button is wired to `ImportPageUI.Close`.
+- Single custom drone panel (STL, density, scrolling node table, one Build Drone button; Back wired to `Close`) — `ImportPageUI.cs`, `NodePlacementUI.cs`
 
 **Next**
-1. Wire a Back/Cancel button on the import panel to `ImportPageUI.Close` (Editor only)
+1. ~~Wire a Back button to `ImportPageUI.Close`~~ (already wired in `Main.unity`; confirmed 2026-10-13)
 2. Remove the `TestSetup` GameObject from `Main.unity`
 3. Audit `Flight.cs` against the unbalanced/climbing symptom
 4. Drone presets: `DronePresetStore.cs`, Save-as-preset button, and the **Preset Drone config** dropdown on the import panel (Editor wiring only)
