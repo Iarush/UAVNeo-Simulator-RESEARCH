@@ -25,8 +25,19 @@ public class ImportPageUI : MonoBehaviour
     // selection during confirm-time validation.
     private string selectedPath;
 
+    // statusText carries two things: the page's own message, and a second line with the mass
+    // service state. Both are kept here and recombined by SetStatus/RefreshStatus so neither
+    // overwrites the other.
+    private string pageMessage = string.Empty;
+    private int shownServiceVersion = -1;
+
     private void OnEnable()
     {
+        // Started here rather than in CustomFrameLoader.Awake(): the bundled interpreter takes
+        // about a second to come up, and Awake() gives the service only 5 s to answer. Only the
+        // custom-frame path pays for it; default-drone students never open this panel.
+        MassServiceLauncher.EnsureRunning();
+
         // State is restored from the statics rather than blanked, so a round trip out to the node
         // placement page and back with the Back button does not lose the selected STL.
         selectedPath = string.IsNullOrEmpty(CustomFrameLoader.SelectedSTLPath)
@@ -36,8 +47,13 @@ public class ImportPageUI : MonoBehaviour
         if (selectedPathText != null)
             selectedPathText.text = selectedPath == null ? NoPathLabel : $"File Path: {selectedPath}";
 
-        if (statusText != null)
-            statusText.text = selectedPath == null ? string.Empty : DescribeSelection(selectedPath);
+        SetStatus(selectedPath == null ? string.Empty : DescribeSelection(selectedPath));
+    }
+
+    private void Update()
+    {
+        if (MassServiceLauncher.Current.version != shownServiceVersion)
+            RefreshStatus();
     }
 
     /// <summary>Hides this panel, returning the user to the main menu.</summary>
@@ -76,25 +92,25 @@ public class ImportPageUI : MonoBehaviour
         // carrying a previous frame's nodes - only NodePlacementUI repopulates the list.
         CustomFrameLoader.SelectedNodes.Clear();
 
-        statusText.text = DescribeSelection(path);
+        SetStatus(DescribeSelection(path));
     }
 
     private void OnStlPickCancelled()
     {
-        statusText.text = "No file selected.";
+        SetStatus("No file selected.");
     }
 
     public void OnConfirmButtonClicked()
     {
         if (string.IsNullOrEmpty(selectedPath))
         {
-            statusText.text = "Select an STL file before confirming.";
+            SetStatus("Select an STL file before confirming.");
             return;
         }
 
         if (!TryReadDensity(out float density))
         {
-            statusText.text = "Density must be a positive number.";
+            SetStatus("Density must be a positive number.");
             return;
         }
 
@@ -103,15 +119,41 @@ public class ImportPageUI : MonoBehaviour
         if (nodePlacementPanel == null)
         {
             Debug.LogError("[ImportPageUI] nodePlacementPanel is not assigned - cannot advance to node placement.", this);
-            statusText.text = "Could not open node placement - see console.";
+            SetStatus("Could not open node placement - see console.");
             return;
         }
 
         // Reported before advancing so the stored values are visible on return via Back.
-        statusText.text = $"Stored {Path.GetFileName(selectedPath)} at {density.ToString(CultureInfo.InvariantCulture)} kg/m^3.";
+        SetStatus($"Stored {Path.GetFileName(selectedPath)} at {density.ToString(CultureInfo.InvariantCulture)} kg/m^3.");
 
         nodePlacementPanel.SetActive(true);
         gameObject.SetActive(false);
+    }
+
+    private void SetStatus(string message)
+    {
+        pageMessage = message;
+        RefreshStatus();
+    }
+
+    private void RefreshStatus()
+    {
+        MassServiceLauncher.Status service = MassServiceLauncher.Current;
+        shownServiceVersion = service.version;
+
+        if (statusText == null)
+            return;
+
+        string serviceLine = service.state == MassServiceLauncher.State.NotStarted
+            ? string.Empty
+            : $"Mass service: {service.message}";
+
+        if (string.IsNullOrEmpty(pageMessage))
+            statusText.text = serviceLine;
+        else if (string.IsNullOrEmpty(serviceLine))
+            statusText.text = pageMessage;
+        else
+            statusText.text = $"{pageMessage}\n{serviceLine}";
     }
 
     private string DescribeSelection(string path)

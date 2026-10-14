@@ -1,0 +1,5 @@
+# Packages installed into the bundled Python (UAVSim/Assets/MassService~/python).
+# Used by tools/build-mass-service.ps1. Pinned for reproducible bundles.
+masscompose==0.1.0
+numpy==2.5.4
+trimesh==5.1.1
