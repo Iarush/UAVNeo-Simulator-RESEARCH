@@ -33,6 +33,24 @@ public class Drone : MonoBehaviour
 
     #region Public Interface
     /// <summary>
+    /// Distance (meters) of the primary chase camera's default offset from the drone, before
+    /// ZoomMultiplier is applied. Used by DroneCameraZoom to auto-fit large custom frames.
+    /// </summary>
+    public static float DefaultCameraDistance => Drone.cameraOffsets[0].magnitude;
+
+    /// <summary>
+    /// Scales every chase camera's follow offset (distance and height) uniformly. 1 = default
+    /// framing. Driven by DroneCameraZoom so a UGUI slider can zoom the view out for large
+    /// custom frames without changing the follow/look-at behavior itself.
+    /// </summary>
+    public float ZoomMultiplier { get; set; } = 1f;
+
+    /// <summary>
+    /// The first player camera (index 0), used by DroneCameraZoom to read FOV for auto-fit math.
+    /// </summary>
+    public Camera PrimaryCamera => this.playerCameras != null && this.playerCameras.Length > 0 ? this.playerCameras[0] : null;
+
+    /// <summary>
     /// The index of the drone.
     /// </summary>
     public int Index { get; private set; }
@@ -226,14 +244,16 @@ public class Drone : MonoBehaviour
     {
         for (int i = 0; i < this.playerCameras.Length; i++)
         {
-            Vector3 followPoint = this.transform.forward * Drone.cameraOffsets[i].z;
-            Vector3 targetCameraPosition = this.transform.position + new Vector3(followPoint.x, Drone.cameraOffsets[i].y, followPoint.z);
+            Vector3 offset = Drone.cameraOffsets[i] * this.ZoomMultiplier;
+            Vector3 followPoint = this.transform.forward * offset.z;
+            Vector3 targetCameraPosition = this.transform.position + new Vector3(followPoint.x, offset.y, followPoint.z);
             this.playerCameras[i].transform.position = Vector3.Lerp(
                 this.playerCameras[i].transform.position,
                 targetCameraPosition,
                 Drone.cameraSpeed * Time.deltaTime);
 
-            this.playerCameras[i].transform.LookAt(this.transform.position + Vector3.up * 0.8f);
+            // Scale the aim height with the offset so the drone keeps the same screen position at every zoom.
+            this.playerCameras[i].transform.LookAt(this.transform.position + Vector3.up * (0.8f * this.ZoomMultiplier));
         }
     }
 }

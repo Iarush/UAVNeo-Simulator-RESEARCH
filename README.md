@@ -9,6 +9,8 @@ UAVSim is a Unity-based simulator for an educational quadrotor drone. It pairs w
 ## Table of Contents
 - [Changelog](#changelog)
 - [Getting Started](#getting-started)
+    - [Manual Flight Controls](#manual-flight-controls)
+    - [Visual Check: Drone and Propellers](#visual-check-drone-and-propellers)
 - [Repository Contents](#repository-contents)
     - [Drone Modules](#drone-modules)
 - [Python Interface](#python-interface)
@@ -64,6 +66,59 @@ def update():
 
 drone.go(start, update)
 ```
+
+### Manual Flight Controls
+
+In default flight mode you can fly the drone from the keyboard or a controller:
+
+| Action | Keyboard | Controller |
+|---|---|---|
+| Launch / land | `L` | — |
+| Forward / back / strafe | `W` `A` `S` `D` | Left joystick |
+| Ascend / descend | `Right Shift` / `Left Shift` | Right / left trigger |
+| Yaw | `←` / `→` | Right joystick X |
+| Max speed down / up | `Z` / `/` | LB / RB |
+| Cycle camera (chase, top-down, front) | `Space` | — |
+| Zoom camera in / out | Mouse wheel, or `=` / `-` (keypad `+` / `-`) | — |
+
+#### Zoom bar
+
+A **zoom bar** (slider) appears on screen in the flight scene. Drag it to zoom in or out: moving it up (right) zooms in, down (left) zooms out. When a custom STL frame is loaded, the bar starts at a zoom fitted to the frame's size, so large or small imported drones start fully in view.
+
+The bar is shown while the drone is on the ground and hides once the drone launches, so it can't capture the arrow keys used for yaw. The mouse wheel and `=` / `-` keys keep zooming in flight. Zoom only moves the follow cameras, so the drone's flight and propeller animation are unchanged.
+
+### Visual Check: Drone and Propellers
+
+Run this check after changing the drone prefab, the flight code, or the custom-frame import, and whenever you import a new model. It confirms that the drone looks right and its propellers spin properly.
+
+**1. Default drone**
+
+1. Open `Main.unity`, press Play, and press **Begin** without importing a frame.
+2. Use the zoom bar to zoom in. You should see the stock drone body with **four propellers, one at each corner**.
+3. Before launch, the propellers are **still**. This is expected because the motors are off.
+4. Press `L` to launch. All four propellers should **start spinning right away and keep spinning** for the whole flight, including while hovering, turning, and landing.
+5. Spin directions should alternate diagonally: **front-left and back-right clockwise, front-right and back-left counter-clockwise** (seen from above).
+6. Fly around (`W` `A` `S` `D`, `Shift`, arrow keys). No propeller should freeze, drift away from its arm, or flicker.
+
+**2. Imported model**
+
+1. Make sure the mass-properties service is running on `127.0.0.1:5070`.
+2. On the main menu, import an `.stl`, enter the density and the six node rows, then press **Begin**.
+3. Check that **your frame is shown and the stock body is hidden**. If you see both overlapping, or only the stock drone, check the Console (see below).
+4. Use the zoom bar to fit the whole frame on screen. Nothing should be clipped or too small to inspect.
+5. Check that **each propeller sits on a motor position** of your frame, not where the stock drone's propellers were.
+6. Repeat steps 3–6 from the default-drone check. Propellers should be still before launch, spin as soon as you press `L`, and keep the same diagonal directions.
+
+**3. Console messages**
+
+With the Console open during Play:
+
+- **Expected:** `[PropellerSpin] Found 4 propellers` and one `[PropellerSpin] Propeller_N ...` line per propeller showing its corner (Front Left, Front Right, Back Left, Back Right) and spin direction. With an imported model, `[CustomFrameLoader] Mass properties: ...` and `[CustomFrameLoader] Motor positions ...` should also appear.
+- **Problem:** any `[CustomFrameLoader] ... Using the default drone.` error means the import failed and the stock drone was used. The message gives the reason (for example, a missing file, an invalid motor layout, or the service not responding).
+- **Problem:** `... is inside default body root ...` means a propeller is under an object that is hidden for custom frames, so that propeller will disappear with an imported model.
+- **Problem:** `defaultBodyObjects is empty` means the stock body will draw on top of your frame.
+
+> **Tip**: Fast-spinning propellers can look slow, stopped, or even backwards on screen because of the frame rate (the "wagon-wheel" effect). If a propeller looks wrong, check its direction in the `[PropellerSpin]` Console line before treating it as a bug.
 
 ## Repository Contents
 
