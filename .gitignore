@@ -65,3 +65,7 @@ sysinfo.txt
 crashlytics-build.properties
 
 Assets/Imported/
+
+# Bundled Python for the mass-properties service: build output of tools/build-mass-service.ps1
+UAVSim/Assets/MassService~/python/
+__pycache__/
