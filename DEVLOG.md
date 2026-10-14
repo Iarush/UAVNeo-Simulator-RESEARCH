@@ -40,7 +40,8 @@ implement custom `.stl` drone import:
 - `TestSetup` (`DebugFrameTestSetup`) is still active in `Main.unity` with a
   hardcoded personal STL path. Remove it.
 - `Flight.cs` has not been audited for the unbalanced/climbing symptom.
-- Drone presets (`DronePresetStore.cs`, save/select UI) are planned, not built.
+- ~~Drone presets (`DronePresetStore.cs`, save/select UI) are planned, not
+  built.~~ Built 2026-10-13; see that entry.
 - The Python mass service (`mass_composer.py`, `udp_listener.py`) is not in this
   repo. The files to use are in the MassCompose repo, at
   `C:\Users\Owner\Documents\MassCompose\src\mass-properties` (see CLAUDE.md).
@@ -49,6 +50,43 @@ implement custom `.stl` drone import:
 
 ## 2026-10-13
 
+- **Drone presets** (`453d3fc`). Students can save the STL path, density
+  and node rows under a name and pick them again later, including in later
+  sessions.
+  - New `UAVSim/Assets/Scripts/Drone/DronePresetStore.cs`: JSON file at
+    `Application.persistentDataPath/drone_presets.json`, written through a temp
+    file + `File.Replace`; corrupt file → empty list, moved aside on next save;
+    same-name save (case-insensitive) overwrites.
+  - `ImportPageUI.cs`: `presetDropdown`, `presetNameInput`,
+    `OnPresetSelected(int)`, `OnSavePresetClicked()`, re-read on every open.
+    `OnEnable` now restores the path from the statics only when the panel has
+    none, so a preset-filled path survives Back.
+  - `NodePlacementUI.cs`: `TryGetValidNodes` (shared by Build and Save),
+    `TryShowNodes` (fills rows from a preset); paste and presets share one
+    `FillRows` helper.
+  - `Main.unity`: preset row (label, dropdown, name field, Save Preset) built
+    via Unity MCP from copies of existing controls; everything below moved down
+    20 px. Object-ID diff against HEAD: 84 added, 0 removed.
+  - Verified in Play mode (Unity MCP): save writes the file; a scrambled panel
+    is restored exactly (7 rows, types, values, density, path) from the
+    dropdown; Build → Back → Begin flew it at 1.850 kg with COM matching hand
+    arithmetic; overwrite, empty-name and bad-layout saves behave; a preset whose
+    STL was deleted shows a clear message, Build refuses it, and re-browse +
+    resave fixes it; a corrupt file loads as empty and is moved aside; a fresh
+    Play session lists the saved presets. After an Editor restart: the preset
+    row, its wiring and layout were intact, and the file written by the
+    previous Editor session listed and loaded both presets exactly (the file
+    was restored from an unchanged copy, as it had been deleted after testing).
+    Not done: a hand click-through.
+  - Known limitation: choosing the preset already shown in the dropdown does
+    nothing; pick another option first to reload it.
+  - Test presets: `drone_presets.json` on this machine holds two test presets,
+    "Moved Frame" (1000 kg/m³) and "test quad 7" (1100 kg/m³). Both use the
+    same 100 mm test cube from a temporary folder, so they look identical and
+    will report the STL missing once that folder is cleared. Delete them, or the
+    whole file, when no longer needed.
+  - Docs: CLAUDE.md (definition of done, Architecture, Drone presets section,
+    Status, Visual Check step 2.2) and README Visual Check step 2.2 updated.
 - **Merged the import and node placement panels into one** (`47d6d13`).
   `CustomDroneImportPanel` now holds the STL path, density and node table;
   `NodePlacementPanel` was deleted. The node rows, row buttons and paste box sit
@@ -88,7 +126,7 @@ implement custom `.stl` drone import:
   "nothing closes the import panel" blocker is removed. The "do not build" rule
   now forbids only creating or destroying rows from code. README Visual Check
   step 2.2 is updated.
-- **Fixed: `SocketException` on leaving Play mode** (uncommitted).
+- **Fixed: `SocketException` on leaving Play mode** (`d6e99a1`).
   `HandleExit` closed `udpClientAsync` while the async thread was blocked in an
   unguarded `Receive`, so the close surfaced as an unhandled exception. In
   `UAVSim/Assets/Scripts/NonMonoBehavior/PythonInterface.cs`:
