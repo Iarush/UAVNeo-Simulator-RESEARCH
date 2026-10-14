@@ -6,8 +6,13 @@ using UnityEngine;
 using UnityEngine.UI;
 
 /// <summary>
-/// Binds the hand-built node placement panel: six permanently-active rows of typed values that
-/// populate <see cref="CustomFrameLoader.SelectedNodes"/>.
+/// Binds the hand-built node table on the custom drone panel: rows of typed values, inside a
+/// scroll view, that populate <see cref="CustomFrameLoader.SelectedNodes"/>.
+/// <see cref="ImportPageUI.OnBuildDroneClicked"/> calls <see cref="TryStoreNodes"/>.
+///
+/// Every row that can ever be shown is built in the Editor under <see cref="nodeListContainer"/>.
+/// Add Row / Remove Row only SetActive them, always keeping the shown rows as one block at the top,
+/// so the hand-built child count is the row cap. Hidden rows are cleared and ignored.
 ///
 /// This script never creates, instantiates or destroys a GameObject. It caches references to
 /// existing children, reads and writes their values, and calls SetActive.
@@ -18,18 +23,23 @@ using UnityEngine.UI;
 public class NodePlacementUI : MonoBehaviour
 {
     private const string ConfirmationMessage =
-        "Drone configured - return to the main menu and press Play to fly.";
+        "Drone configured - press Back, then Begin to fly.";
+
+    /// <summary>
+    /// Remove Row stops here: the pipeline is quadcopter-only, so a valid layout always needs at
+    /// least the four motor rows.
+    /// </summary>
+    private const int MinShownRows = 4;
 
     public Transform nodeListContainer;
     public TMP_Text infoText;
     public Button buildDroneButton;
-
-    /// <summary>Import panel shown again by the Back button. SetActive only.</summary>
-    public GameObject importPanel;
+    public Button addRowButton;
+    public Button removeRowButton;
 
     /// <summary>
     /// Optional multi-line field for pasting a whole table of nodes. Rows are written straight into
-    /// the six hand-built rows above (dropdown + four input fields), so the paste path and the typed
+    /// the hand-built rows above (dropdown + four input fields), so the paste path and the typed
     /// path share one validator and one store: <see cref="TryCollectNodes"/>.
     /// </summary>
     public TMP_InputField bulkPasteInput;
@@ -66,13 +76,14 @@ public class NodePlacementUI : MonoBehaviour
         AssertDropdownOptions();
         RegisterFieldListeners();
         started = true;
+        RefreshRowButtons();
         RefreshValidation();
     }
 
     private void OnEnable()
     {
-        // Deliberately does NOT clear any input: typed values must survive the round trip to the
-        // import page and back.
+        // Deliberately does NOT clear any input: typed values must survive closing the panel with
+        // Back and reopening it.
         if (started && !showingConfirmation)
             RefreshValidation();
     }
@@ -224,8 +235,9 @@ public class NodePlacementUI : MonoBehaviour
     }
 
     /// <summary>
-    /// Parses every row. A row with all four numeric fields blank is skipped silently; a row with
-    /// any field filled must have all four valid, with mass strictly greater than zero.
+    /// Parses every shown row; hidden rows are ignored. A row with all four numeric fields blank is
+    /// skipped silently; a row with any field filled must have all four valid, with mass strictly
+    /// greater than zero.
     /// </summary>
     private bool TryCollectNodes(out List<CustomFrameLoader.NodeData> nodes, out string message)
     {
@@ -234,6 +246,9 @@ public class NodePlacementUI : MonoBehaviour
 
         foreach (Row row in rows)
         {
+            if (row.Root != null && !row.Root.activeSelf)
+                continue;
+
             string rowName = row.Root != null ? row.Root.name : "(unnamed row)";
 
             if (!row.IsBound)
@@ -317,11 +332,13 @@ public class NodePlacementUI : MonoBehaviour
     // ================================================================
 
     /// <summary>
-    /// Stores the configuration into the CustomFrameLoader statics. Deliberately does NOT start
-    /// the simulation - the contract is populate the statics, then load the flight scene, which
-    /// happens when the user presses Play from the main menu.
+    /// Stores the node rows into <see cref="CustomFrameLoader.SelectedNodes"/>, or reports why they
+    /// are invalid and leaves the list untouched. Called by Build Drone via ImportPageUI, which
+    /// stores the path and density only when this returns true. Deliberately does NOT start the
+    /// simulation - the contract is populate the statics, then load the flight scene, which
+    /// happens when the user presses Begin from the main menu.
     /// </summary>
-    public void OnBuildDroneClicked()
+    public bool TryStoreNodes()
     {
         bool valid = TryCollectNodes(out List<CustomFrameLoader.NodeData> nodes, out string message);
         if (valid)
@@ -334,7 +351,7 @@ public class NodePlacementUI : MonoBehaviour
                 infoText.text = message;
             if (buildDroneButton != null)
                 buildDroneButton.interactable = false;
-            return;
+            return false;
         }
 
         CustomFrameLoader.SelectedNodes.Clear();
@@ -344,15 +361,17 @@ public class NodePlacementUI : MonoBehaviour
         showingConfirmation = true;
         if (infoText != null)
             infoText.text = ConfirmationMessage;
+        return true;
     }
 
     /// <summary>
     /// Parses the pasted table in <see cref="bulkPasteInput"/> into the existing rows. Column order
     /// matches the table on screen: Type, X, Y, Z, Mass - one node per line, comma- or
     /// tab-separated. Type accepts the dropdown label (spacing/case ignored), "FC"/"Offboard", or
-    /// the raw NodeType index. Rows past the pasted count are cleared, which the collector treats
-    /// as "no node". Nothing is stored here: the rows fire their onValueChanged listeners exactly
-    /// as if the user had typed, and Build Drone remains the only writer of SelectedNodes.
+    /// the raw NodeType index. The shown rows are resized to the pasted count (never below
+    /// <see cref="MinShownRows"/>, which leaves any extra shown rows blank, i.e. "no node").
+    /// Nothing is stored here: the rows fire their onValueChanged listeners exactly as if the user
+    /// had typed, and Build Drone remains the only writer of SelectedNodes.
     /// </summary>
     public void OnApplyPasteClicked()
     {
@@ -414,10 +433,11 @@ public class NodePlacementUI : MonoBehaviour
 
         if (parsed.Count > rows.Count)
         {
-            Report($"Pasted {parsed.Count} nodes but the table has {rows.Count} rows.");
+            Report($"Pasted {parsed.Count} nodes but the table holds at most {rows.Count} rows.");
             return;
         }
 
+        int shown = Mathf.Max(parsed.Count, MinShownRows);
         for (int i = 0; i < rows.Count; i++)
         {
             Row row = rows[i];
@@ -434,18 +454,84 @@ public class NodePlacementUI : MonoBehaviour
             }
             else
             {
-                row.X.text = string.Empty;
-                row.Y.text = string.Empty;
-                row.Z.text = string.Empty;
-                row.Mass.text = string.Empty;
+                ClearRow(row);
             }
+
+            row.Root.SetActive(i < shown);
         }
 
-        // The field writes above already re-validated through the onValueChanged listeners; this
-        // final pass only decides whether to replace an empty (valid) message with a summary.
+        RefreshRowButtons();
+
+        // The field writes above already re-validated through the onValueChanged listeners, but
+        // before the SetActive calls; this pass sees the final shown rows, and then decides whether
+        // to replace an empty (valid) message with a summary.
         RefreshValidation();
         if (buildDroneButton != null && buildDroneButton.interactable && infoText != null)
             infoText.text = $"Filled {parsed.Count} row(s) from the pasted table - check the values, then press Build Drone.";
+    }
+
+    // ================================================================
+    // Add / remove rows
+    // ================================================================
+
+    /// <summary>Shows the first hidden row, blank.</summary>
+    public void OnAddRowClicked()
+    {
+        Row row = rows.Find(r => r.Root != null && !r.Root.activeSelf);
+        if (row == null)
+            return;
+
+        if (row.IsBound)
+            ClearRow(row);
+        row.Root.SetActive(true);
+
+        RefreshRowButtons();
+        HandleFieldChanged();
+    }
+
+    /// <summary>Clears and hides the last shown row, never going below <see cref="MinShownRows"/>.</summary>
+    public void OnRemoveRowClicked()
+    {
+        if (CountShownRows() <= MinShownRows)
+            return;
+
+        Row row = rows.FindLast(r => r.Root != null && r.Root.activeSelf);
+        // Cleared as well as hidden, so a later Add Row never brings back stale values.
+        if (row.IsBound)
+            ClearRow(row);
+        row.Root.SetActive(false);
+
+        RefreshRowButtons();
+        HandleFieldChanged();
+    }
+
+    private int CountShownRows()
+    {
+        int shown = 0;
+        foreach (Row row in rows)
+        {
+            if (row.Root != null && row.Root.activeSelf)
+                shown++;
+        }
+        return shown;
+    }
+
+    private void RefreshRowButtons()
+    {
+        int shown = CountShownRows();
+        if (addRowButton != null)
+            addRowButton.interactable = shown < rows.Count;
+        if (removeRowButton != null)
+            removeRowButton.interactable = shown > MinShownRows;
+    }
+
+    private static void ClearRow(Row row)
+    {
+        row.Type.value = (int)CustomFrameLoader.NodeType.Motor;
+        row.X.text = string.Empty;
+        row.Y.text = string.Empty;
+        row.Z.text = string.Empty;
+        row.Mass.text = string.Empty;
     }
 
     private void Report(string message)
@@ -475,16 +561,5 @@ public class NodePlacementUI : MonoBehaviour
         }
         type = -1;
         return false;
-    }
-
-    /// <summary>Returns to the import panel. Typed values are left untouched.</summary>
-    public void OnBackButtonClicked()
-    {
-        if (importPanel != null)
-            importPanel.SetActive(true);
-        else
-            Debug.LogError("[NodePlacementUI] importPanel is not assigned.", this);
-
-        gameObject.SetActive(false);
     }
 }
