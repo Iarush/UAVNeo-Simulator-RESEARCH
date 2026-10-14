@@ -220,9 +220,7 @@ public class NodePlacementUI : MonoBehaviour
 
     private void RefreshValidation()
     {
-        bool valid = TryCollectNodes(out List<CustomFrameLoader.NodeData> nodes, out string message);
-        if (valid)
-            valid = MotorQuadrants.TryValidateMotorLayout(nodes, out message);
+        bool valid = TryGetValidNodes(out _, out string message);
 
         if (buildDroneButton != null)
             buildDroneButton.interactable = valid;
@@ -232,6 +230,18 @@ public class NodePlacementUI : MonoBehaviour
 
         if (infoText != null)
             infoText.text = valid ? string.Empty : message;
+    }
+
+    /// <summary>
+    /// Parses the shown rows and checks the motor layout, without storing anything. Build Drone
+    /// and Save Preset both go through this, so a preset can only hold a layout that would build.
+    /// </summary>
+    public bool TryGetValidNodes(out List<CustomFrameLoader.NodeData> nodes, out string message)
+    {
+        bool valid = TryCollectNodes(out nodes, out message);
+        if (valid)
+            valid = MotorQuadrants.TryValidateMotorLayout(nodes, out message);
+        return valid;
     }
 
     /// <summary>
@@ -340,9 +350,7 @@ public class NodePlacementUI : MonoBehaviour
     /// </summary>
     public bool TryStoreNodes()
     {
-        bool valid = TryCollectNodes(out List<CustomFrameLoader.NodeData> nodes, out string message);
-        if (valid)
-            valid = MotorQuadrants.TryValidateMotorLayout(nodes, out message);
+        bool valid = TryGetValidNodes(out List<CustomFrameLoader.NodeData> nodes, out string message);
 
         if (!valid)
         {
@@ -437,20 +445,59 @@ public class NodePlacementUI : MonoBehaviour
             return;
         }
 
-        int shown = Mathf.Max(parsed.Count, MinShownRows);
+        FillRows(parsed, $"Filled {parsed.Count} row(s) from the pasted table - check the values, then press Build Drone.");
+    }
+
+    /// <summary>
+    /// Writes a preset's nodes into the rows and shows exactly that many (never fewer than
+    /// <see cref="MinShownRows"/>). Like paste, nothing is stored: Build Drone stays the only
+    /// writer of SelectedNodes.
+    /// </summary>
+    /// <returns>False, with the rows untouched, when the preset has more nodes than there are rows.</returns>
+    public bool TryShowNodes(IReadOnlyList<DronePresetNode> nodes, out string message)
+    {
+        showingConfirmation = false;
+
+        if (nodes.Count > rows.Count)
+        {
+            message = $"This preset has {nodes.Count} nodes but the table holds at most {rows.Count} rows.";
+            Report(message);
+            return false;
+        }
+
+        var values = new List<(int type, string x, string y, string z, string mass)>();
+        foreach (DronePresetNode node in nodes)
+        {
+            values.Add((node.type, FormatNumber(node.x), FormatNumber(node.y), FormatNumber(node.z),
+                FormatNumber(node.massKg)));
+        }
+
+        FillRows(values, $"Loaded {nodes.Count} row(s) from the preset - press Build Drone to use them.");
+        message = string.Empty;
+        return true;
+    }
+
+    /// <summary>
+    /// Fills the first rows with the given values, clears the rest, and shows as many rows as
+    /// there are values (minimum <see cref="MinShownRows"/>). Shows the summary when the result is
+    /// valid; otherwise the validation message stays.
+    /// </summary>
+    private void FillRows(List<(int type, string x, string y, string z, string mass)> values, string summary)
+    {
+        int shown = Mathf.Max(values.Count, MinShownRows);
         for (int i = 0; i < rows.Count; i++)
         {
             Row row = rows[i];
             if (!row.IsBound)
                 continue;
 
-            if (i < parsed.Count)
+            if (i < values.Count)
             {
-                row.Type.value = parsed[i].type;
-                row.X.text = parsed[i].x;
-                row.Y.text = parsed[i].y;
-                row.Z.text = parsed[i].z;
-                row.Mass.text = parsed[i].mass;
+                row.Type.value = values[i].type;
+                row.X.text = values[i].x;
+                row.Y.text = values[i].y;
+                row.Z.text = values[i].z;
+                row.Mass.text = values[i].mass;
             }
             else
             {
@@ -464,10 +511,16 @@ public class NodePlacementUI : MonoBehaviour
 
         // The field writes above already re-validated through the onValueChanged listeners, but
         // before the SetActive calls; this pass sees the final shown rows, and then decides whether
-        // to replace an empty (valid) message with a summary.
+        // to replace an empty (valid) message with the summary.
         RefreshValidation();
         if (buildDroneButton != null && buildDroneButton.interactable && infoText != null)
-            infoText.text = $"Filled {parsed.Count} row(s) from the pasted table - check the values, then press Build Drone.";
+            infoText.text = summary;
+    }
+
+    /// <summary>Round-trip format, so a saved 0.15 comes back as "0.15" and not "0.1500000".</summary>
+    private static string FormatNumber(float value)
+    {
+        return value.ToString("R", CultureInfo.InvariantCulture);
     }
 
     // ================================================================
