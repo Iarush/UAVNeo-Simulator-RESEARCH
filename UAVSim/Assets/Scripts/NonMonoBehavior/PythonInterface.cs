@@ -73,7 +73,11 @@ public class PythonInterface
         this.udpClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         this.udpClient.Client.ReceiveTimeout = PythonInterface.timeoutTime;
 
-        // Create a new thread with a UDP client for handling async calls
+        // Create the UDP client for async calls here rather than on its thread, so HandleExit can always close it
+        this.udpClientAsync = new UdpClient(new IPEndPoint(PythonInterface.bindAddress, PythonInterface.unityPortAsync));
+        this.udpClientAsync.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+
+        // Create a new thread for handling async calls
         this.asyncClientThread = new Thread(new ThreadStart(this.ProcessAsyncCalls))
         {
             IsBackground = true
@@ -105,6 +109,8 @@ public class PythonInterface
             this.pythonEndPoints.Clear();
             LevelManager.UpdateConnectedPrograms();
 
+            // Closing the async client interrupts its thread's blocking Receive; the flag tells that thread to stop quietly
+            this.isClosing = true;
             this.udpClient.Close();
             this.udpClientAsync.Close();
             this.wasExitHandled = true;
@@ -193,6 +199,11 @@ public class PythonInterface
     /// True if exit was properly handled.
     /// </summary>
     private bool wasExitHandled;
+
+    /// <summary>
+    /// True once HandleExit has started closing the UDP clients. Read by the async thread.
+    /// </summary>
+    private volatile bool isClosing;
 
     #region Sync
     /// <summary>
@@ -573,7 +584,7 @@ public class PythonInterface
     /// <summary>
     /// The UDP client used to handle async API calls from Python.
     /// </summary>
-    private UdpClient udpClientAsync;
+    private readonly UdpClient udpClientAsync;
 
     /// <summary>
     /// A thread containing a UDP client to process asynchronous API calls from Python.
@@ -581,16 +592,28 @@ public class PythonInterface
     private readonly Thread asyncClientThread;
 
     /// <summary>
-    /// Creates a UDP client to process asynchronous API calls from Python (for use by Jupyter).
+    /// Processes asynchronous API calls from Python (for use by Jupyter) until HandleExit closes the client.
     /// </summary>
     private void ProcessAsyncCalls()
     {
-        this.udpClientAsync = new UdpClient(new IPEndPoint(PythonInterface.bindAddress, PythonInterface.unityPortAsync));
-        this.udpClientAsync.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         while (true)
         {
             IPEndPoint receiveEndPoint = new IPEndPoint(IPAddress.Any, 0);
-            byte[] data = this.udpClientAsync.Receive(ref receiveEndPoint);
+            byte[] data;
+            try
+            {
+                data = this.udpClientAsync.Receive(ref receiveEndPoint);
+            }
+            catch (Exception e) when (this.isClosing && (e is SocketException || e is ObjectDisposedException))
+            {
+                // HandleExit closed the client to stop this thread
+                return;
+            }
+            catch (SocketException e) when (e.SocketErrorCode == SocketError.ConnectionReset)
+            {
+                // On Windows, an earlier send to a Python port that has since closed is reported as a reset here; keep listening
+                continue;
+            }
             Header header = (Header)data[0];
 
             Drone drone = LevelManager.GetDrone();
