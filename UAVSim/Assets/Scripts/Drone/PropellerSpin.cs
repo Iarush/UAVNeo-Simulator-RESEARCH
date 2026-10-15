@@ -58,17 +58,21 @@ public class PropellerSpin : MonoBehaviour
             // (drone forward = +Z, drone right = +X, drone up = +Y)
             Vector3 localPos = transform.InverseTransformPoint(propellers[i].position);
 
-            bool isFront = localPos.z >= 0;
-            bool isLeft = localPos.x < 0;
-
             // Desired spin directions:
             //   FL = CW,  FR = CCW
             //   BL = CCW, BR = CW
+            // Flight.MotorSpeeds order is FR, FL, BL, BR (Flight.cs MotorSpeeds doc), which is
+            // neither the Propeller_N name order nor the MotorQuadrants.Quadrant order, so map
+            // each corner to its motor index explicitly - never cast the Quadrant.
             bool wantCW;
-            if (isFront && isLeft) wantCW = true;       // FL → CW
-            else if (isFront && !isLeft) wantCW = false; // FR → CCW
-            else if (!isFront && isLeft) wantCW = false;  // BL → CCW
-            else wantCW = true;                            // BR → CW
+            string quadrant;
+            switch (MotorQuadrants.ClassifyUnity(localPos))
+            {
+                case MotorQuadrants.Quadrant.FrontLeft: wantCW = true; motorIndices[i] = 1; quadrant = "Front Left"; break;
+                case MotorQuadrants.Quadrant.FrontRight: wantCW = false; motorIndices[i] = 0; quadrant = "Front Right"; break;
+                case MotorQuadrants.Quadrant.BackLeft: wantCW = false; motorIndices[i] = 2; quadrant = "Back Left"; break;
+                default: wantCW = true; motorIndices[i] = 3; quadrant = "Back Right"; break;
+            }
 
             // Check if this propeller's local Y aligns with or opposes the drone's up.
             // FBX imports can flip the local axis on some children. If inverted,
@@ -81,12 +85,6 @@ public class PropellerSpin : MonoBehaviour
 
             directions[i] = sign;
 
-            // Flight.MotorSpeeds order is FR, FL, BL, BR (Flight.cs MotorSpeeds doc), which is
-            // not the Propeller_N name order, so map by quadrant.
-            if (isFront) motorIndices[i] = isLeft ? 1 : 0;
-            else motorIndices[i] = isLeft ? 2 : 3;
-
-            string quadrant = (isFront ? "Front" : "Back") + (isLeft ? " Left" : " Right");
             string target = wantCW ? "CW" : "CCW";
             Debug.Log($"[PropellerSpin] Propeller_{i} at local({localPos.x:F3}, {localPos.y:F3}, {localPos.z:F3}) → {quadrant}, target={target}, meshInverted={meshInverted}, sign={sign}");
         }
@@ -124,16 +122,17 @@ public class PropellerSpin : MonoBehaviour
         for (int i = 0; i < propellers.Length; i++)
         {
             Vector3 localPos = transform.InverseTransformPoint(propellers[i].position);
-            bool isFront = localPos.z >= 0;
-            bool isLeft = localPos.x < 0;
 
             // positions are drone-root local; propellers live under the rotated, 4.5x-scaled
             // DroneModel, so convert through world space rather than assigning localPosition.
             Vector3 target;
-            if (isFront && isLeft) target = fl;
-            else if (isFront && !isLeft) target = fr;
-            else if (!isFront && isLeft) target = bl;
-            else target = br;
+            switch (MotorQuadrants.ClassifyUnity(localPos))
+            {
+                case MotorQuadrants.Quadrant.FrontLeft: target = fl; break;
+                case MotorQuadrants.Quadrant.FrontRight: target = fr; break;
+                case MotorQuadrants.Quadrant.BackLeft: target = bl; break;
+                default: target = br; break;
+            }
             propellers[i].position = transform.TransformPoint(target);
 
             // Keep the stock prop-diameter-to-arm ratio so props match the new frame's size

@@ -48,8 +48,110 @@ implement custom `.stl` drone import:
 
 ---
 
+## 2026-10-14
+
+- **CLAUDE.md stale entries fixed** (the list in the handoff, §1). The mass
+  sanity check is ticked: the cube runs matched hand arithmetic for mass, COM
+  and inertia, including the off-centre-battery case. The Python service files
+  are noted as in version control and pinned, with only a review still open.
+  The Editor run of the `~` folder is marked as done. "Start here" now points
+  to `docs/handoff-flight-fixes.md`. Status → Done gains the motor-corner rule
+  and the audit, hover test and mass check.
+- **Climbing symptom reproduced and explained (audit finding 1, confirmed in
+  Unity). No code changed.** Frames whose yaw inertia is below about
+  0.00555 kg·m², or whose roll/pitch inertia is below about 0.00165 kg·m², go
+  unstable at the 0.02 s physics step with `Flight.cs`'s fixed gains. Every step
+  the motors then saturate, and the "raise all motors" rule (`Flight.cs:757-762`)
+  turns that into a runaway climb. Unity traces via temporary runtime probes:
+  - 1.2 kg frame (cube100 at 1000 kg/m³, four 0.05 kg motors at CAD ±0.05 m;
+    yaw inertia 0.00267): stayed level, yaw rate grew ×−3.2 per step (predicted
+    ×−3.16), diagonal motor pairs alternated 0/1257 rad/s, climbing at 33 m/s
+    after 3 s.
+  - 0.28 kg frame (cube at 100 kg/m³, four 0.02 kg motors at ±0.08 m, 0.1 kg
+    battery): diverged within 0.3 s, climbed to about 111 m, hard crash, and
+    repeated on every respawn.
+  - Default drone kicks: yaw rate rang at exactly −0.85 per step as predicted
+    (stock yaw inertia is only 8% above the limit); roll kick settled in 0.12 s.
+  - `tools/flight-audit/flight_loop_replica.py` gained a coupled 3-axis +
+    altitude model that reproduces all four cases. Audit doc updated
+    (`docs/flight-audit-2026-10-13.md`, finding 1, "Climb symptom", task B
+    summary). Proposed fixes (inertia-scaled gains; no unrequested thrust from
+    saturation handling) wait on user approval.
+- **One shared motor-corner rule (task C), done, no behaviour change.** The rule (front = Unity `z >= 0`, left = `x < 0`, a point on a line
+  counts as front / right) now lives only in the new
+  `MotorQuadrants.ClassifyUnity(Vector3)`, which takes a Unity-local Y-up position.
+  - `MotorQuadrants.Classify` (CAD Z-up) converts with `ConvertZUpToYUp`, then
+    calls `ClassifyUnity`.
+  - `PropellerSpin.FindPropellers` and `SetPropellerPositions` switch on
+    `ClassifyUnity`. The corner → `Flight.MotorSpeeds` index map (FR=0, FL=1,
+    BL=2, BR=3) is written out explicitly per case, never cast from `Quadrant`
+    (FL=0, FR=1, ...). Spin directions and the `→ Front Left ...` log text are
+    unchanged.
+  - `CustomFrameLoader.RepositionPropellers` switches on `ClassifyUnity` in
+    place of its inline `isFront`/`isLeft` chain (user-approved; the file is
+    change-by-approval). Same "already assigned" error path and log text; no
+    protocol or `Awake()` change.
+  - Verified via Unity MCP. Compiles clean. `ClassifyUnity`: (0,0,0) →
+    FrontRight, (-0.1,0,0) → FrontLeft, (0,0,-0.1) → BackRight, (-0.1,0,-0.1) →
+    BackLeft. `Classify` gives the same corners as before for the four cube-quad
+    motors and for a plus-layout motor at CAD (0, 0.15, 0) (FrontRight). A layout
+    with two front-right motors still says "Two in front-right motors, none in
+    front-left." For both the default drone and the cube quad (B.1), the
+    `[PropellerSpin]` lines (corner, target, meshInverted, sign) and
+    `[CustomFrameLoader] Motor positions` match a pre-edit baseline line for line.
+    The props land on (±0.15, 0, ±0.15). The cube quad was re-run after the loader
+    edit, with the same result.
+
 ## 2026-10-13
 
+- **Symmetric X-quad hover test (task B): PASSED, no code changed.** Run via
+  Unity MCP. A sampler armed the drone, waited for `[Flight] Launch complete`,
+  then logged state every 0.5 s for 20 s with no input.
+  - Cube quad (`tools/test-data/cube100.stl`, 1000 kg/m³, four 0.05 kg motors
+    at CAD (±0.15, ±0.15, 0), battery 0.5 kg at the origin): mass 1.7 kg, COM 0,
+    inertia (0.006167, 0.006167, 0.010667), armEffective 0.15. Altitude error
+    under 2.3 mm after 2 s and 0.0000 m from 10 to 20 s. Pitch, roll and yaw
+    change 0.000°, horizontal drift 0.0000 m. All four motors at 675.76 rad/s,
+    which equals √(m·g/4/kf).
+  - Default drone: 2.0 kg, same result, motors at 732.97 rad/s.
+  - **Control: the pass says little about balance.** With the battery moved
+    to CAD (0.1, 0, 0) (COM (0.0294, 0, 0)) the drone still hovered dead level
+    with all motors equal (0.000 % spread). A real quad would need about a 20 %
+    motor-speed spread to hold that. This confirms audit lead 3: thrust is
+    applied at the COM and mixing assumes an ideal symmetric X, so an
+    off-centre COM has no effect in flight.
+  - Hovers about 0.54 m below the logged launch altitude (7.36 vs 7.9). Launch
+    ends within 0.5 m of the target and resets `TargetAltitude` to the current
+    height. This is expected from the code, not drift.
+  - `TestSetup` is `m_IsActive: 0` in the committed `Main.unity`, so the
+    default route gets no fallback error (CLAUDE.md said it was active).
+  - Side issue, not reproduced: in one Play session the launcher logged
+    "no reply ... after 10 s" while the service answered the real request 5 s
+    later. Other sessions were driving the same Editor at that moment.
+- **`Flight.cs` audit (task A), read-only, no code changed.** Findings in
+  `docs/flight-audit-2026-10-13.md`; offline replica of the control loops in
+  `tools/flight-audit/flight_loop_replica.py`. Main results: the fixed gains go
+  unstable at the 0.02 s step for roll/pitch inertia below about 0.00165 kg·m² and
+  yaw inertia below about 0.00555 kg·m² (25 Hz jitter on small frames; the stock
+  drone is just inside). Per-motor roll/yaw sign tables are mirrored left to right
+  (flight unaffected, telemetry and crash damage affected). `CrashSystem` zeroes
+  the wrong `MotorHealth` index. COM offset and arm length have no effect on
+  flight. Frames over 5.88 kg cannot hover. Altitude hold has no steady-state climb.
+  Correction: a NaN `armLength` would make the drone fall, not climb. Checked in
+  Unity: rotation sign conventions, and the cube quad's inertia on the right axes
+  (Y-Y = 0.010667). The proposed fixes wait on user approval.
+- **Decided: one shared motor-corner rule** (CLAUDE.md Status → Next, item 6;
+  was "Optional"). The front/back, left/right rule is copied in
+  `MotorQuadrants.cs`, `CustomFrameLoader.cs` and twice in `PropellerSpin.cs`.
+  The copies agree today; the change is to stop them drifting apart under
+  future edits. Not started; `CustomFrameLoader.cs` edits need approval.
+- **Handoff written:** `docs/handoff-flight-audit-and-motor-corners.md`. It has
+  step-by-step instructions for the `Flight.cs` audit (leads with line
+  numbers), the symmetric X-quad hover test (setup, sampling, pass criteria),
+  and the motor-corner refactor (plan, the FL/FR motor-order trap, before/after
+  checks). Test STL added at `tools/test-data/cube100.stl` (100 mm ASCII cube,
+  centred). It also lists stale CLAUDE.md entries. `TestSetup` stays for now
+  (user decision).
 - **Drone presets** (`453d3fc`). Students can save the STL path, density
   and node rows under a name and pick them again later, including in later
   sessions.
