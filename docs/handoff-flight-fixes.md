@@ -4,7 +4,11 @@ Written 2026-10-14 so a fresh session can pick this up cold. CLAUDE.md loads
 automatically; read it first. This file has the cause, the drafted code changes, how to
 verify them, and the traps found along the way.
 
-**Status: the changes below are DRAFTS. They are not applied to `Flight.cs`.** The user has
+**Update 2026-10-14: Fix 1 (section 3) is APPLIED and verified in Unity** (user-approved;
+results in `docs/flight-audit-2026-10-13.md`, finding 1, "Fix applied"). The user chose
+Fix 1 only. Fix 2 (section 4) and section 7 are still drafts that need separate approval.
+
+**Original status: the changes below are DRAFTS. They are not applied to `Flight.cs`.** The user has
 had the fix explained and asked for this draft. **Get the user's explicit approval before
 editing `Flight.cs`.** It flies every drone in every lab, and CLAUDE.md requires the
 default drone and all labs to behave exactly as before.

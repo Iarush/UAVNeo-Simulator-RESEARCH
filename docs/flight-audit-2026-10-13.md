@@ -39,9 +39,11 @@ Unity facts measured in the Editor (left-handed, Y up, Z forward):
 Legend: **BUG** = wrong behaviour. **LIMIT** = a deliberate simplification that limits
 realism. **OK** = checked and correct. **UNKNOWN** = not settled.
 
-### 1. BUG: light frames are unstable at the 50 Hz physics rate and climb away (confirmed in Unity)
+### 1. BUG: light frames are unstable at the 50 Hz physics rate and climb away (confirmed in Unity) — FIXED 2026-10-14
 
-**This explains the "keeps climbing" symptom.**
+**This explains the "keeps climbing" symptom.** Fixed by scaling the attitude gains by
+inertia (Fix 1 of `docs/handoff-flight-fixes.md`); see "Fix applied" at the end of this
+finding. Fix 2 (yaw lowest priority) was not applied.
 
 The gains are fixed (`Kp_rp = 10`, `Kd_rp = 0.06`, `Kp_yaw = 0.55`; `:123-132`) and do
 not use the frame's inertia. With a 0.02 s step, the explicit loop goes unstable when
@@ -104,6 +106,40 @@ Second line of defence (also needs approval): stop the saturation handling from 
 thrust that altitude hold did not ask for. For example, scale the yaw command down first
 when a motor would go negative; real flight controllers give yaw the lowest priority. A
 bad frame would then spin or wobble in place instead of rocketing upward.
+
+**Fix applied (2026-10-14, user-approved, Fix 1 only).** `Flight.cs` now multiplies each
+axis's commanded torque by (body-axis inertia ÷ stock inertia 0.003 / 0.006 / 0.003):
+fields `pitchGainScale` / `yawGainScale` / `rollGainScale`, set in `Start()` from
+`Ixx/Iyy/Izz` and `customInertiaRotation` via `BodyAxisInertia` (diagonal of
+R·diag(I)·Rᵀ) and `GainScale` (falls back to 1 on a non-finite or non-positive result).
+`Start()` logs `[Flight] Attitude gain scale (pitch, yaw, roll) = (…)`. Fix 2 and the
+other drafted fixes were not applied.
+
+Verified in Unity 6000.4.5f1 via Unity MCP (Play mode, temporary probes, no input except
+where stated). Kicks were applied 8 s and 14 s after `Launch complete`:
+
+| Frame | Gain scale (p, y, r) | Hover motors | Altitude error / tilt (2–8 s, 18–20 s) | 0.5 rad/s yaw kick, body rate per step | 2 rad/s roll kick, roll ° per step |
+|---|---|---|---|---|---|
+| Default drone | 1.000, 1.000, 1.000 | 732.97 × 4 | ≤ 2.4 mm / 0.000° | 0.50 −0.42 0.36 −0.31 0.26 (**identical to before**) | 2.29 0.54 −1.28 −0.63 0.64 0.54 −0.27 −0.39 (**identical**) |
+| Cube quad 1.7 kg | 2.056, 1.778, 2.056 | 675.76 × 4 | ≤ 2.4 mm / 0.000° | 0.50 −0.42 0.35 −0.30 0.25 | 2.29 0.57 −1.30 −0.69 0.65 |
+| Yaw-light 1.2 kg | 0.722, 0.444, 0.722 | 567.75 × 4 | ≤ 2.4 mm / 0.000° (was: runaway climb) | 0.50 −0.44 0.38 −0.33 0.29 | 2.29 0.51 −1.27 −0.58 0.63 |
+| Small 0.28 kg | 0.226, 0.198, 0.226 | 274.25 × 4 | ≤ 2.5 mm / 0.000° (was: runaway climb, crash) | 0.50 −0.46 0.42 −0.39 0.35 | 2.29 0.27 −1.11 −0.27 0.52 |
+
+All four motors were equal to 0.01 rad/s in every hover; no `CrashSystem` messages.
+Stick test (full forward 4 s, full strafe 2 s, full yaw 2 s, full climb 1 s, MaxSpeed
+0.5): every frame tilted 20.3–20.6°, reached 7.8–11.3 m/s, yawed at the 3 rad/s clamp
+(2.98–3.00), climbed 3.75–4.24 m in 1 s and returned level. Altitude change during full
+yaw: stock ±0.012 m, cube quad −0.019/+0.071 m, yaw-light −0.059/+0.021 m, small
+−0.181/+0.069 m. All frames, stock included, were still 0.08–0.13 m off target 6 s after
+the climb input (slow altitude-hold settle, existing behaviour).
+
+**Residual limit (not fixed).** The angular drag torque (`angularDragCoeff = 0.005`,
+`Flight.cs` "Aerodynamic angular drag") is not scaled, so it weighs more on lighter
+frames. That is why the yaw kick rings ×−0.88 per step at 1.2 kg and ×−0.92 at 0.28 kg
+(stock ×−0.85), matching 1 − Kp_yaw·dt/0.006 − 0.005·dt/Iyy. The yaw axis now goes
+unstable only below about **Iyy ≈ 0.0006 kg·m²** (was 0.00555), and roll/pitch only
+below about **0.00011 kg·m²** (was 0.00165). A very small frame (e.g. a sub-100 g
+whoop) could still hit it. Fix 2 would contain the climb in that case.
 
 ### 2. LIMIT: heavier frames are underdamped (lead 2)
 
@@ -325,8 +361,9 @@ default drone keeps COM (0,0,0) and identity rotation, exactly as before `edc07f
 
 ## Proposed next steps (each needs user approval)
 
-1. Scale the attitude gains by inertia (finding 1, which also fixes finding 2). The
-   stock drone is unchanged by construction. This is the fix for the climb.
+1. ~~Scale the attitude gains by inertia (finding 1, which also fixes finding 2). The
+   stock drone is unchanged by construction. This is the fix for the climb.~~ Done
+   2026-10-14; see "Fix applied" under finding 1.
 2. Stop saturation handling from adding unrequested thrust, e.g. yaw gets lowest
    priority (finding 1, second line of defence).
 3. Flip `motorRollSign` / `motorYawSign` (finding 4) and fix the `CrashSystem` index
@@ -336,4 +373,4 @@ default drone keeps COM (0,0,0) and identity rotation, exactly as before `edc07f
 5. Decide whether custom frames should feel COM offset and motor placement (finding 3).
    This is a design change, not a bug fix.
 6. After any fix, re-run the two light frames from finding 1 plus the default drone and
-   cube quad in Unity.
+   cube quad in Unity. (Done for step 1 on 2026-10-14.)
