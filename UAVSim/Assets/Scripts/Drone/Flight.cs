@@ -127,9 +127,25 @@ public class Flight : DroneModule
     private const float Kd_rp = 0.06f;
 
     /// <summary>Proportional gain for yaw rate control (N*m/(rad/s)).
-    /// Time constant = Iyy/Kp_yaw = 0.006/0.55 = 0.011s — instant yaw.
+    /// Time constant = Iyy/Kp_yaw = 0.006/0.55 = 0.011s — instant yaw, for the stock
+    /// inertia; scaled per frame, see yawGainScale.
     /// </summary>
     private const float Kp_yaw = 0.55f;
+
+    // --------- Inertia-scaled gains ---------
+
+    // The attitude gains above were tuned for the stock drone's inertia. A custom frame's
+    // torques are scaled by (its body-axis inertia / these values) so it responds like the
+    // stock drone. Unscaled, frames with yaw inertia below ~0.0056 kg*m^2 (roll/pitch below
+    // ~0.0017) are unstable at the 0.02 s physics step and climb away (docs/flight-audit-2026-10-13.md).
+    private const float GainRefIxx = 0.003f;
+    private const float GainRefIyy = 0.006f;
+    private const float GainRefIzz = 0.003f;
+
+    // Exactly 1 for the stock drone.
+    private float pitchGainScale = 1f;
+    private float yawGainScale = 1f;
+    private float rollGainScale = 1f;
 
     // --------- User Input Limits ---------
 
@@ -491,6 +507,12 @@ public class Flight : DroneModule
         this.rBody.inertiaTensor = new Vector3(Ixx, Iyy, Izz);
         this.rBody.inertiaTensorRotation = this.customInertiaRotation;
 
+        Vector3 bodyInertia = BodyAxisInertia(new Vector3(Ixx, Iyy, Izz), this.customInertiaRotation);
+        this.pitchGainScale = GainScale(bodyInertia.x, GainRefIxx);
+        this.yawGainScale = GainScale(bodyInertia.y, GainRefIyy);
+        this.rollGainScale = GainScale(bodyInertia.z, GainRefIzz);
+        Debug.Log($"[Flight] Attitude gain scale (pitch, yaw, roll) = ({this.pitchGainScale:F3}, {this.yawGainScale:F3}, {this.rollGainScale:F3})");
+
         this.rBody.constraints = RigidbodyConstraints.None;
         this.rBody.maxAngularVelocity = maxAngularVelocity * 2f;
         this.rBody.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
@@ -725,9 +747,9 @@ public class Flight : DroneModule
         float rollError = (desiredRoll - currentRoll) * Mathf.Deg2Rad;
         float yawRateError = desiredYawRate - q;
 
-        float tauPitch = Kp_rp * pitchError - Kd_rp * p;
-        float tauRoll = Kp_rp * rollError - Kd_rp * r;
-        float tauYaw = Kp_yaw * yawRateError;
+        float tauPitch = (Kp_rp * pitchError - Kd_rp * p) * this.pitchGainScale;
+        float tauRoll = (Kp_rp * rollError - Kd_rp * r) * this.rollGainScale;
+        float tauYaw = Kp_yaw * yawRateError * this.yawGainScale;
 
         // ================================================================
         // 7. MOTOR MIXING (X-CONFIGURATION) WITH SATURATION HANDLING
@@ -923,5 +945,25 @@ public class Flight : DroneModule
     {
         if (angle > 180f) angle -= 360f;
         return angle;
+    }
+
+    /// <summary>
+    /// Moment of inertia about each body axis: the diagonal of R * diag(principal) * R^T.
+    /// </summary>
+    private static Vector3 BodyAxisInertia(Vector3 principal, Quaternion rotation)
+    {
+        Matrix4x4 R = Matrix4x4.Rotate(rotation);
+        Vector3 result = Vector3.zero;
+        for (int a = 0; a < 3; a++)
+            for (int k = 0; k < 3; k++)
+                result[a] += R[a, k] * R[a, k] * principal[k];
+        return result;
+    }
+
+    /// <summary>inertia / reference, or 1 if that is not a usable positive number.</summary>
+    private static float GainScale(float inertia, float reference)
+    {
+        float scale = inertia / reference;
+        return float.IsFinite(scale) && scale > 0f ? scale : 1f;
     }
 }

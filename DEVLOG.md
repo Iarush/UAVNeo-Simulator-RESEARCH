@@ -50,6 +50,34 @@ implement custom `.stl` drone import:
 
 ## 2026-10-14
 
+- **Climbing bug fixed: attitude gains scale with each frame's inertia
+  (`Flight.cs`, user-approved, Fix 1 of `docs/handoff-flight-fixes.md` only).**
+  Each axis's commanded torque in `FixedUpdate()` is multiplied by (body-axis
+  inertia ÷ stock 0.003 / 0.006 / 0.003). New: constants `GainRefIxx/Iyy/Izz`,
+  fields `pitchGainScale` / `yawGainScale` / `rollGainScale` (set in `Start()`
+  and logged as `[Flight] Attitude gain scale (pitch, yaw, roll) = …`), helpers
+  `BodyAxisInertia` and `GainScale`. For the stock drone every scale is exactly
+  1, so its maths is bit-for-bit unchanged. Verified in Unity via Unity MCP:
+  - Default drone: scales (1, 1, 1); yaw-kick trace 0.50 −0.42 0.36 −0.31 0.26
+    and roll-kick trace 2.29 0.54 −1.28 −0.63 0.64 identical to the
+    pre-fix baseline; motors 732.97 × 4.
+  - Cube quad 1.7 kg: (2.056, 1.778, 2.056), motors 675.76 × 4, kicks settle.
+  - 1.2 kg yaw-light and 0.28 kg frames, which climbed away before: (0.722,
+    0.444, 0.722) and (0.226, 0.198, 0.226). Both hover with altitude error
+    ≤ 2.5 mm, tilt 0.000°, four equal motors, no crash messages, kicks settle.
+  - Stick test on all four frames (full forward, strafe, yaw, climb): similar
+    response everywhere (20.3–20.6° tilt, yaw at the 3 rad/s clamp, 3.75–4.24 m
+    climb in 1 s), all level afterwards.
+  - Residual: the angular drag torque is not scaled, so yaw now goes unstable
+    only below Iyy ≈ 0.0006 kg·m² (was 0.00555) and roll/pitch below ≈ 0.00011
+    (was 0.00165). Details in `docs/flight-audit-2026-10-13.md`, finding 1,
+    "Fix applied".
+  - Not applied, each still waiting on approval: Fix 2 (yaw lowest priority in
+    the mixer), sign tables, `CrashSystem` motor index, too-heavy warning, dead
+    code. Not yet flown by hand.
+  - Test artefact, not a regression: reloading `DroneWorld` in place from a
+    RunCommand logs a `SocketException` from `PythonInterface..ctor`
+    (`PythonInterface.cs:72`, port still bound by the previous scene's instance).
 - **CLAUDE.md stale entries fixed** (the list in the handoff, §1). The mass
   sanity check is ticked: the cube runs matched hand arithmetic for mass, COM
   and inertia, including the off-centre-battery case. The Python service files
