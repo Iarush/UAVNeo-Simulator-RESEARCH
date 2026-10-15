@@ -4,7 +4,8 @@ using UnityEngine;
 
 /// <summary>
 /// Single source of truth for the motor-to-propeller-corner contract enforced by
-/// <c>CustomFrameLoader.RepositionPropellers</c> (CustomFrameLoader.cs:82-128).
+/// <c>CustomFrameLoader.RepositionPropellers</c>. The corner rule itself lives only in
+/// <see cref="ClassifyUnity"/>; the loader and <c>PropellerSpin</c> call it too.
 ///
 /// The node-placement UI validates against this so it can never disagree with the loader:
 /// anything <see cref="TryValidateMotorLayout"/> accepts is exactly what RepositionPropellers
@@ -32,17 +33,30 @@ public static class MotorQuadrants
     /// <summary>
     /// Classifies a CAD-frame node position into the corner RepositionPropellers would pick.
     ///
-    /// This deliberately performs the SAME two steps as CustomFrameLoader.cs:93-95 - convert to
-    /// Unity Y-up first, then test the converted .z and .x - rather than short-circuiting to the
-    /// equivalent CAD-frame test (y >= 0, x &lt; 0). Going through the same conversion means that
-    /// if ConvertZUpToYUp is ever changed, this follows it automatically instead of silently
-    /// drifting out of agreement with the loader.
+    /// This deliberately performs the SAME two steps as RepositionPropellers - convert to Unity
+    /// Y-up first, then classify the converted point with <see cref="ClassifyUnity"/> - rather
+    /// than short-circuiting to the equivalent CAD-frame test (y >= 0, x &lt; 0). Going through
+    /// the same conversion means that if ConvertZUpToYUp is ever changed, this follows it
+    /// automatically instead of silently drifting out of agreement with the loader.
     /// </summary>
     public static Quadrant Classify(Vector3 stlPosition)
     {
-        Vector3 position = StlMeshLoader.ConvertZUpToYUp(stlPosition);
-        bool isFront = position.z >= 0f;
-        bool isLeft = position.x < 0f;
+        return ClassifyUnity(StlMeshLoader.ConvertZUpToYUp(stlPosition));
+    }
+
+    /// <summary>
+    /// Classifies a position that is already in the drone's Unity-local Y-up frame
+    /// (+Z forward, +X right, +Y up). This is the only copy of the corner rule: the CAD-frame
+    /// <see cref="Classify"/>, CustomFrameLoader.RepositionPropellers and PropellerSpin all go
+    /// through it.
+    ///
+    /// Boundaries are asymmetric: z == 0 counts as front and x == 0 counts as right, so a point
+    /// at the origin is FrontRight.
+    /// </summary>
+    public static Quadrant ClassifyUnity(Vector3 unityPosition)
+    {
+        bool isFront = unityPosition.z >= 0f;
+        bool isLeft = unityPosition.x < 0f;
 
         if (isFront && isLeft) return Quadrant.FrontLeft;
         if (isFront && !isLeft) return Quadrant.FrontRight;
@@ -77,7 +91,7 @@ public static class MotorQuadrants
     /// <summary>
     /// Checks a full node list against the RepositionPropellers contract: exactly four Motor
     /// nodes, one in each quadrant. Non-motor nodes are ignored, matching the loader's own
-    /// filter at CustomFrameLoader.cs:87-88.
+    /// filter in RepositionPropellers.
     /// </summary>
     /// <param name="message">Empty when valid; otherwise a specific description of the failure.</param>
     /// <returns>True when the layout will satisfy RepositionPropellers.</returns>

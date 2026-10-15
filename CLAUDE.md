@@ -23,9 +23,9 @@ A student can **import their own drone frame (`.stl`) into UAVSim and fly it**. 
 
 - [ ] Custom-drone path reaches flight from the main menu with no Editor tricks. (No longer blocked: Back is wired to `ImportPageUI.Close`. On 2026-10-13, an Editor run calling Build Drone, then `Close()`, then `BeginSimulation()` flew the 100 mm cube with the expected values. Still to do: click through it by hand.)
 - [ ] `DebugFrameTestSetup` / `TestSetup` removed; the normal gameplay route no longer touches custom-frame statics.
-- [ ] Mass sanity check passes: a known-volume cube at known density matches hand arithmetic for mass, COM and inertia.
-- [ ] A symmetric X-quad with correct inputs hovers without drift or climb; `Flight.cs` audited against the unbalanced/climbing symptom.
-- [ ] `mass_composer.py` / `udp_listener.py` are in version control and reviewed, or their location is documented and pinned. (Location is now documented under Architecture: the MassCompose repo. Still open: their current changes are uncommitted, and nothing pins a version.)
+- [x] Mass sanity check passes: a known-volume cube at known density matches hand arithmetic for mass, COM and inertia. (Passed 2026-10-13 end to end through Unity: `tools/test-data/cube100.stl` at 1000 kg/m³, four 0.05 kg motors at CAD (±0.15, ±0.15, 0), battery 0.5 kg. With the battery at the origin: 1.7 kg, COM 0, moments 0.006167 / 0.006167 / 0.010667. With the battery at (0.1, 0, 0): COM x 0.02941, moments 0.006167 / 0.009696 / 0.014196. Both match hand arithmetic to the printed digits.)
+- [ ] A symmetric X-quad with correct inputs hovers without drift or climb; `Flight.cs` audited against the unbalanced/climbing symptom. (Hover part passed 2026-10-13 via Unity MCP, for the cube quad and the default drone. Over 20 s: altitude error under 2.3 mm, pitch, roll and yaw change 0.000°, drift 0.0000 m, all four motors equal at √(m·g/4/kf). Caveat: an off-centre-COM control run hovered just as perfectly, so this test cannot detect imbalance; see DEVLOG 2026-10-13. Still to do: a hand click-through.)
+- [ ] `mass_composer.py` / `udp_listener.py` are in version control and reviewed, or their location is documented and pinned. (In version control: the copies Unity runs are at `UAVSim/Assets/MassService~/mass-properties/` since `282d53c`, and `masscompose`, `numpy` and `trimesh` are pinned in `tools/mass-service-requirements.txt`. Still open: a code review.)
 - [ ] Default (non-custom) drone and all existing lab modules behave exactly as before.
 - [ ] Saving a preset writes its STL path, density and shown node rows (4–12) to disk; after restarting Unity the preset shows in the **Preset Drone config** dropdown. (Built. Verified 2026-10-13 via Unity MCP: a fresh Play session lists the saved presets, and after an Editor restart the file written by the previous Editor session listed and loaded both presets with every value. The file had been deleted and restored from an unchanged copy in between, so it was not on disk during the restart itself. Still to do: a hand click-through.)
 - [ ] Selecting a preset fills the path, density and node rows exactly as they were saved, and Begin then flies it through the same path as a hand-entered import. (Verified 2026-10-13 via Unity MCP: a 7-node preset restored every value and the row count, then Build → Back → Begin flew it at 1.850 kg with COM matching hand arithmetic. Still to do: a hand click-through.)
@@ -57,10 +57,10 @@ A student can **import their own drone frame (`.stl`) into UAVSim and fly it**. 
 
 - `Drone/CustomFrameLoader.cs` — the whole import pipeline. Builds/sends the UDP request, parses the response, loads the mesh, replaces the drone visual, applies mass properties, repositions propellers. Runs from `Awake()`, `[DefaultExecutionOrder(-100)]`.
 - `Drone/StlMeshLoader.cs` — static ASCII+binary STL parser → `Mesh`; owns the mm→m scale and the Z-up↔Y-up conversion helpers.
-- `Drone/Flight.cs` — flight model. `ApplyCustomMassProperties()` receives the computed values; `Start()` writes them onto the `Rigidbody`. **Never audited.**
+- `Drone/Flight.cs` — flight model. `ApplyCustomMassProperties()` receives the computed values; `Start()` writes them onto the `Rigidbody`. Audited 2026-10-13, see `docs/flight-audit-2026-10-13.md`.
 - `Drone/PropellerSpin.cs` — propeller visuals; `SetPropellerPositions(Vector3[])` accepts FL/FR/BL/BR.
 - `Drone/DebugFrameTestSetup.cs` — temporary test harness, see Known cruft.
-- `Drone/MotorQuadrants.cs` — shared FL/FR/BL/BR contract. `Classify` mirrors the loader's comparison; `TryValidateMotorLayout` is the single validator used by both the UI and `Awake()`.
+- `Drone/MotorQuadrants.cs` — shared FL/FR/BL/BR contract. `ClassifyUnity` holds the one copy of the corner rule (Unity-local Y-up); `Classify` converts from CAD Z-up and calls it; `TryValidateMotorLayout` is the single validator used by both the UI and `Awake()`.
 - `UI/ImportPageUI.cs` — the single hand-built custom drone panel (`CustomDroneImportPanel`): browse for STL, density entry, and the **Build Drone** button (`OnBuildDroneClicked`), which checks the STL exists and the density, calls `NodePlacementUI.TryStoreNodes`, and only then writes `SelectedSTLPath` / `SelectedDensity`. Also hosts the preset row: the **Preset Drone config** dropdown (`OnPresetSelected`) and **Save Preset** (`OnSavePresetClicked`).
 - `Drone/MassServiceLauncher.cs` — static class, creates no GameObjects. `EnsureRunning()` probes port 5070 and, if nothing answers, starts the bundled `python.exe` and polls until it is ready. It kills only the process it started, on `Application.quitting`. `Current` exposes the state for the UI.
 - `Editor/MassServiceBuildStep.cs` — `IPostprocessBuildWithReport`; copies `Assets/MassService~` into a Windows player's `StreamingAssets/MassService`.
@@ -187,7 +187,7 @@ UAVSim/Assets/MassService~/            tilde = ignored by the Unity importer (no
 
 - At runtime in a build: `<Name>_Data/StreamingAssets/MassService/`, filled by an `IPostprocessBuildWithReport` step that copies the folder. In the Editor: `Application.dataPath + "/MassService~"`. One resolver function picks the right one.
 - `python/` is a build output and is git-ignored. The `mass-properties/` copy is committed (decided: it is not pulled from MassCompose).
-- The `~` folder and the post-build copy compile but have not yet been exercised in a running Editor or a build.
+- The `~` folder has been exercised in a running Editor (2026-10-13; see Verified above). The post-build copy compiles but has not yet been exercised in a build.
 
 ### Build recipe (steps 1–5 verified on 2026-10-13)
 
@@ -294,10 +294,9 @@ A preset is a saved copy of one import: the STL path, the density, and the fille
 
 ## Open questions (unresolved — do not assume answered)
 
-- `Flight.cs` has **never been audited.** A NaN `armLength` reaching `Flight.cs:50` `armEffective` would give a NaN moment arm — no attitude authority while still climbing. That hole is now closed at `CustomFrameLoader.cs:201` (`!IsFinite(armLength)`), but whether it ever fired historically is unknowable: before the fix it passed silently with no log.
-- `mass_composer.py` and `udp_listener.py` have **never been code-reviewed** — and are not in this repo; they live in the MassCompose repo (see Architecture).
+- `Flight.cs` was audited on 2026-10-13 (`docs/flight-audit-2026-10-13.md`). Still open from that audit, each waiting on user approval: **fixed attitude gains make frames with roll/pitch inertia below about 0.00165 kg·m² or yaw inertia below about 0.00555 kg·m² unstable, and the motor-saturation rule (`Flight.cs:757-762`) turns that into a runaway climb.** This is the cause of the climbing symptom, reproduced in Unity on 2026-10-14 with a 1.2 kg and a 0.28 kg frame. The proposed fix is to scale the gains by inertia, which leaves the stock drone unchanged; per-motor roll/yaw sign tables are mirrored left to right (flight unaffected, but telemetry and crash damage are); `CrashSystem` zeroes the wrong `MotorHealth` index; COM offset and motor positions have no effect on flight. Correction: a NaN `armLength` would make every motor 0 rad/s (`Mathf.Max(NaN, 0f)` returns 0), so the drone would fall, not climb. That hole is closed at `CustomFrameLoader.cs` (`!IsFinite(armLength)`).
+- `mass_composer.py` and `udp_listener.py` have **never been code-reviewed**. The copies Unity runs are in this repo at `UAVSim/Assets/MassService~/mass-properties/` (since `282d53c`), with dependencies pinned in `tools/mass-service-requirements.txt`; the originals live in the MassCompose repo (see Architecture).
 - The mirror (see Coordinate conventions): harmless on a symmetric X-quad, wrong on chiral geometry. **Deferred, not fixed.**
-- No end-to-end mass sanity check has been run — e.g. a known-volume cube at known density versus hand arithmetic.
 - The visual spin of the mock drone remains unexplained.
 - Preset STL paths are absolute. If the student moves or renames the `.stl`, the preset loads with a missing file. Decide whether to store a copy of the STL next to the preset file instead. Not decided.
 
@@ -305,7 +304,7 @@ A preset is a saved copy of one import: the STL path, the density, and the fille
 
 **`DebugFrameTestSetup`** (`UAVSim/Assets/Scripts/Drone/DebugFrameTestSetup.cs`) — temporary test harness; its own header says it is safe to delete once the real import UI exists (which it now does).
 
-- **Still present and ACTIVE in `UAVSim/Assets/Scenes/Main.unity`** on a GameObject named `TestSetup` (`m_IsActive: 1`), a child of `MainMenu`.
+- **Still present but INACTIVE in `UAVSim/Assets/Scenes/Main.unity`** on a GameObject named `TestSetup` (`m_IsActive: 0` in the committed scene, checked 2026-10-13), a child of `MainMenu`. While inactive, none of the injection below runs, and the default route launches with no fallback error. The notes below describe what happens if it is re-enabled.
 - `[DefaultExecutionOrder(-200)]` — runs **before** `CustomFrameLoader` (`-100`), so its values land first.
 - The scene carries a hardcoded personal path: `Main.unity:18750` → `TestSTLPath: C:\Users\Owner\Downloads\Part Studio 1 - Part 1.stl`. The C# default (`:9`) is `""`; the serialized Inspector value overrides it.
 - **Node injection is guarded** by `if (SelectedNodes.Count == 0)` (`:20`) — it only backfills an empty list.
@@ -391,12 +390,17 @@ With the Console open during Play:
 - Shared quadrant contract — `MotorQuadrants.cs`
 - Single custom drone panel (STL, density, scrolling node table, one Build Drone button; Back wired to `Close`) — `ImportPageUI.cs`, `NodePlacementUI.cs`
 - Drone presets (save, select, persist to `drone_presets.json`) — `DronePresetStore.cs`, `ImportPageUI.cs`
+- One motor-corner rule (`MotorQuadrants.ClassifyUnity`), used by the panel, the loader and `PropellerSpin` — `MotorQuadrants.cs`, `CustomFrameLoader.cs`, `PropellerSpin.cs`
+- `Flight.cs` audit (read-only), symmetric X-quad hover test, cube mass sanity check — `docs/flight-audit-2026-10-13.md`, DEVLOG 2026-10-13/14
 
 **Next**
+
+> **Start here:** the audit, the hover test and the motor-corner refactor from `docs/handoff-flight-audit-and-motor-corners.md` are all done (2026-10-13/14). The next step is the drafted `Flight.cs` fixes in `docs/handoff-flight-fixes.md`, which need user approval before anything is applied. The test cube is at `tools/test-data/cube100.stl`. Leave `TestSetup` in place for now (user decision, 2026-10-13).
+
 1. ~~Wire a Back button to `ImportPageUI.Close`~~ (already wired in `Main.unity`; confirmed 2026-10-13)
 2. Remove the `TestSetup` GameObject from `Main.unity`
-3. Audit `Flight.cs` against the unbalanced/climbing symptom
+3. ~~Audit `Flight.cs` against the unbalanced/climbing symptom~~ (audit done 2026-10-13, read-only, no code changed: `docs/flight-audit-2026-10-13.md`. Fixes it proposes are waiting on user approval. The symmetric X-quad hover test passed 2026-10-13, but an off-centre-COM control hovered just as perfectly; see DEVLOG. Climbing cause found 2026-10-14: frames with low inertia go unstable at the fixed gains, and the saturation rule then makes them climb away; see audit finding 1. **Drafted fix, not applied, needs user approval: `docs/handoff-flight-fixes.md`.**)
 4. ~~Drone presets: `DronePresetStore.cs`, Save-as-preset button, and the **Preset Drone config** dropdown on the import panel~~ (built 2026-10-13; see Drone presets. Still to do: a hand click-through)
 5. Optional: main-menu "custom drone armed" indicator + Clear
-6. Optional: collapse `RepositionPropellers` onto `MotorQuadrants.Classify`; note `PropellerSpin.cs:59-60` and `:120-121` hold two more copies in Unity-local space, needing a non-converting overload
+6. ~~**Single source for the motor-corner rule.**~~ (done 2026-10-14). The rule "front = at or ahead of the centre line, left = left of it (on the line counts as right)" now lives only in `MotorQuadrants.ClassifyUnity(Vector3)` (Unity-local Y-up, no conversion). `MotorQuadrants.Classify` (CAD Z-up, panel validation) converts and calls it, and so do `CustomFrameLoader.RepositionPropellers` (user-approved edit) and both `PropellerSpin` sites (`FindPropellers`: spin direction and motor index; `SetPropellerPositions`: propeller-to-motor placement). `PropellerSpin` maps corner → `Flight.MotorSpeeds` index (FR=0, FL=1, BL=2, BR=3) explicitly; never cast a `Quadrant` to a motor index. Verified via Unity MCP: logs for the default drone and the cube quad match a pre-edit baseline. See DEVLOG 2026-10-14. Related, not done: `CrashSystem.DetachArmGroup` zeroes `MotorHealth` by `Propeller_N` order, not motor order (`docs/flight-audit-2026-10-13.md`, finding 4).
 7. Auto-launch the mass service from a bundled Python 3.13: built and Editor-tested; built-player test pending (see the section above)

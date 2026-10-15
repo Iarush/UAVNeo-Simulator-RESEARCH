@@ -123,8 +123,8 @@ public class CustomFrameLoader : MonoBehaviour
 
     /// <summary>
     /// Moves the propeller visuals to match the motor nodes supplied for this custom frame,
-    /// matching each Motor node to a corner by the sign of its x/z position (same front/left
-    /// convention PropellerSpin uses: +Z front, -X left).
+    /// matching each Motor node to a corner with MotorQuadrants.ClassifyUnity (the same rule
+    /// PropellerSpin and the panel validation use: +Z front, -X left).
     /// </summary>
     private void RepositionPropellers()
     {
@@ -138,14 +138,15 @@ public class CustomFrameLoader : MonoBehaviour
             // service, so they need the same axis conversion as the mesh/com (they're already
             // meter-scale, not millimeters, so no MillimetersToMeters scale here).
             Vector3 position = StlMeshLoader.ConvertZUpToYUp(node.position);
-            bool isFront = position.z >= 0f;
-            bool isLeft = position.x < 0f;
 
             bool alreadyAssigned;
-            if (isFront && isLeft) { alreadyAssigned = fl.HasValue; fl = position; }
-            else if (isFront && !isLeft) { alreadyAssigned = fr.HasValue; fr = position; }
-            else if (!isFront && isLeft) { alreadyAssigned = bl.HasValue; bl = position; }
-            else { alreadyAssigned = br.HasValue; br = position; }
+            switch (MotorQuadrants.ClassifyUnity(position))
+            {
+                case MotorQuadrants.Quadrant.FrontLeft: alreadyAssigned = fl.HasValue; fl = position; break;
+                case MotorQuadrants.Quadrant.FrontRight: alreadyAssigned = fr.HasValue; fr = position; break;
+                case MotorQuadrants.Quadrant.BackLeft: alreadyAssigned = bl.HasValue; bl = position; break;
+                default: alreadyAssigned = br.HasValue; br = position; break;
+            }
 
             if (alreadyAssigned)
             {
