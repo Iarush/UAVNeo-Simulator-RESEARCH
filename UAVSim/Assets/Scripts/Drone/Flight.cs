@@ -149,6 +149,9 @@ public class Flight : DroneModule
     private float xyP, xyVelP, xyVelI, xyVelD;   // MPC_XY_P, MPC_XY_VEL_P/I/D_ACC
     private float zP, zVelP, zVelI, zVelD;       // MPC_Z_P, MPC_Z_VEL_P/I/D_ACC
     private float xyVelMax, zVelMaxUp, zVelMaxDown, accHor, tiltMax, thrMin, thrMax;
+    private float velManual, manualYawRate;      // MPC_VEL_MANUAL (m/s), MPC_MAN_Y_MAX (deg/s)
+    private float accUpMax, accDownMax;          // MPC_ACC_UP_MAX, MPC_ACC_DOWN_MAX (m/s^2)
+    private float climbSetpoint;                 // keyboard climb-rate setpoint, ramped (m/s)
     private Vector3 velIntegral;                 // m/s^2
     private Vector3 previousVelocity;
     private bool haveVelocity;
@@ -156,11 +159,26 @@ public class Flight : DroneModule
     /// <summary>Hold: velocity setpoint ramped to zero at MPC_ACC_HOR, then a position lock.</summary>
     private bool holding;
     private Vector2 brakeVelocitySetpoint;
+    private Vector2 setpointAcceleration;        // the ramp's acceleration, jerk-limited (m/s^2)
+    private float jerkMax;                       // MPC_JERK_MAX (m/s^3)
+    private float accHorMax;                     // MPC_ACC_HOR_MAX (m/s^2), braking
     private bool positionLocked;
     private Vector2 lockedPosition;
 
     /// <summary>Heading (deg) held while there is no yaw input; NaN while yawing.</summary>
     private float yawLock = float.NaN;
+
+    /// <summary>
+    /// Keyboard speed (m/s) at 1.0 x MaxSpeed. Replaces the real drone's MPC_VEL_MANUAL (1 m/s),
+    /// which felt too slow to fly by hand; 30 m/s matches the old sim's top speed (owner 2026-10-20).
+    /// </summary>
+    public const float KeyboardMaxSpeed = 30f;
+
+    /// <summary>
+    /// Keyboard climb/descent rate (m/s) at 1.0 x MaxSpeed. Replaces the real drone's
+    /// MPC_Z_VEL_MAX_UP/DN (0.6 m/s), which felt too slow to fly by hand (owner 2026-10-20).
+    /// </summary>
+    public const float KeyboardMaxClimbRate = 10f;
 
     /// <summary>Stick values below this count as released (as before).</summary>
     private const float StickDeadband = 0.05f;
@@ -234,6 +252,17 @@ public class Flight : DroneModule
     /// The input yaw rotation, ranging from -1 (full left) to 1 (full right).
     /// </summary>
     public float YawSpeed { get; set; } = 0;
+
+    /// <summary>
+    /// Who is flying (spec section 4.4). Pcmd: Python send_pcmd, tilt meaning. PosCtl:
+    /// keyboard/controller, PX4 position mode (sticks command velocity, release brakes and holds).
+    /// </summary>
+    public enum ControlMode { Pcmd, PosCtl }
+
+    /// <summary>
+    /// The input path, set by LevelManager when the simulation mode changes.
+    /// </summary>
+    public ControlMode Mode { get; set; } = ControlMode.Pcmd;
 
     /// <summary>
     /// The max speed multiplier set by the user, ranging from 0 to 1.
@@ -589,12 +618,13 @@ public class Flight : DroneModule
         float heading = this.transform.eulerAngles.y;
         bool horizontalInput = Mathf.Abs(this.ForwardSpeed) >= StickDeadband || Mathf.Abs(this.StrafeSpeed) >= StickDeadband;
         bool verticalInput = Mathf.Abs(this.VerticalSpeed) >= StickDeadband;
+        bool posCtl = this.Mode == ControlMode.PosCtl;
 
         // ================================================================
-        // 3. YAW (send_pcmd meaning): yaw 1.0 = pcmdMaxYawRateDegS about world up, no banking.
-        //    The heading is held when the yaw input is released.
+        // 3. YAW: yaw 1.0 = pcmdMaxYawRateDegS (send_pcmd) or MPC_MAN_Y_MAX (keyboard) about
+        //    world up, no banking. The heading is held when the yaw input is released.
         // ================================================================
-        float desiredYawRate = this.YawSpeed * maxYawRate * Mathf.Deg2Rad;
+        float desiredYawRate = this.YawSpeed * (posCtl ? this.manualYawRate : maxYawRate) * Mathf.Deg2Rad;
         if (this.YawSpeed != 0f)
             this.yawLock = float.NaN;
         else if (float.IsNaN(this.yawLock))
@@ -602,33 +632,52 @@ public class Flight : DroneModule
         float yawSetpoint = float.IsNaN(this.yawLock) ? heading : this.yawLock;
 
         // ================================================================
-        // 4. VERTICAL: throttle input = thrust offset (as before); released = PX4 altitude hold
-        //    (PositionControl _positionControl/_velocityControl, z axis), climb and descent
-        //    limited by MPC_Z_VEL_MAX_UP/DN.
+        // 4. VERTICAL: send_pcmd throttle = thrust offset (as before); keyboard triggers = climb
+        //    rate up to MPC_Z_VEL_MAX_UP/DN x MaxSpeed; released = PX4 altitude hold
+        //    (PositionControl _positionControl/_velocityControl, z axis), limited by MPC_Z_VEL_MAX_UP/DN.
         // ================================================================
         float accelerationUp = 0f;
-        if (verticalInput)
-        {
+        bool directThrust = verticalInput && !posCtl;
+        // Keyboard climb release: the climb setpoint ramps back to zero before the altitude locks.
+        bool climbStopping = posCtl && !verticalInput && this.climbSetpoint != 0f;
+        if (verticalInput || climbStopping)
             TargetAltitude = this.transform.position.y;
+        if (directThrust)
+        {
             this.velIntegral.y = 0f;
         }
         else
         {
-            float vzSetpoint = Mathf.Clamp(this.zP * (TargetAltitude - this.transform.position.y), -this.zVelMaxDown, this.zVelMaxUp);
+            float vzSetpoint, accelerationFeedForward = 0f;
+            if (verticalInput || climbStopping)
+            {
+                // Keyboard climb: the setpoint ramps at MPC_ACC_UP_MAX / MPC_ACC_DOWN_MAX, and that
+                // acceleration is fed forward (PX4 trajectory setpoint), so the loop does not overshoot.
+                float target = verticalInput ? this.VerticalSpeed * KeyboardMaxClimbRate * scale : 0f;
+                float ramped = Mathf.MoveTowards(this.climbSetpoint, target, (target > this.climbSetpoint ? this.accUpMax : this.accDownMax) * dt);
+                accelerationFeedForward = (ramped - this.climbSetpoint) / dt;
+                this.climbSetpoint = vzSetpoint = ramped;
+            }
+            else
+            {
+                vzSetpoint = Mathf.Clamp(this.zP * (TargetAltitude - this.transform.position.y), -this.zVelMaxDown, this.zVelMaxUp);
+                this.climbSetpoint = posCtl ? 0f : velocity.y;
+            }
             float vzError = vzSetpoint - velocity.y;
-            accelerationUp = this.zVelP * vzError + this.velIntegral.y - this.zVelD * acceleration.y;
+            accelerationUp = accelerationFeedForward + this.zVelP * vzError + this.velIntegral.y - this.zVelD * acceleration.y;
             this.velIntegral.y = Mathf.Clamp(this.velIntegral.y + this.zVelI * vzError * dt, -gravity, gravity);
         }
 
         // ================================================================
         // 5. HORIZONTAL -> ATTITUDE SETPOINT
         //    Tilt input (send_pcmd meaning): pitch/roll = value x pcmdMaxTiltDeg x MaxSpeed.
-        //    Released: hold. The velocity setpoint ramps from the current velocity to zero at
-        //    MPC_ACC_HOR, then the position locks; the PX4 velocity loop turns that into an
-        //    acceleration, so the drone stops only by tilting.
+        //    Keyboard (PX4 POSCTL): sticks = velocity target up to MPC_VEL_MANUAL x MaxSpeed in the
+        //    heading frame. In both modes the velocity setpoint ramps toward its target at
+        //    MPC_ACC_HOR (released: zero, then the position locks); the PX4 velocity loop turns
+        //    that into an acceleration, so the drone stops only by tilting.
         // ================================================================
         Quaternion attitudeSetpoint;
-        if (horizontalInput)
+        if (horizontalInput && !posCtl)
         {
             this.holding = false;
             this.positionLocked = false;
@@ -645,19 +694,44 @@ public class Flight : DroneModule
             {
                 this.holding = true;
                 this.brakeVelocitySetpoint = horizontalVelocity;
+                this.setpointAcceleration = Vector2.ClampMagnitude(new Vector2(acceleration.x, acceleration.z), this.accHor);
             }
-            this.brakeVelocitySetpoint = Vector2.MoveTowards(this.brakeVelocitySetpoint, Vector2.zero, this.accHor * dt);
-            if (!this.positionLocked && this.brakeVelocitySetpoint == Vector2.zero && horizontalVelocity.magnitude < PositionLockSpeed)
+            Vector2 velocityTarget = Vector2.zero;
+            if (horizontalInput)
+            {
+                Vector3 stick = Quaternion.Euler(0f, yawSetpoint, 0f) * new Vector3(this.StrafeSpeed, 0f, this.ForwardSpeed);
+                velocityTarget = Vector2.ClampMagnitude(new Vector2(stick.x, stick.z), 1f) * this.velManual * scale;
+                this.positionLocked = false;
+            }
+            // Jerk-limited ramp (PX4 trajectory, MPC_ACC_HOR / MPC_JERK_MAX): the acceleration builds
+            // up and dies away at MPC_JERK_MAX, so the drone tilts in and out smoothly instead of
+            // stepping. The wanted acceleration shrinks near the target so the setpoint lands on it.
+            Vector2 setpointError = velocityTarget - this.brakeVelocitySetpoint;
+            // MPC_ACC_HOR_MAX for speeding up, turning and braking (owner 2026-10-20: MPC_ACC_HOR felt sluggish).
+            float rampAcceleration = this.accHorMax;
+            Vector2 wantedAcceleration = setpointError.normalized * Mathf.Min(rampAcceleration,Mathf.Sqrt(2f * this.jerkMax * setpointError.magnitude));
+            this.setpointAcceleration = Vector2.MoveTowards(this.setpointAcceleration, wantedAcceleration, this.jerkMax * dt);
+            Vector2 step = this.setpointAcceleration * dt;
+            if (step.magnitude >= setpointError.magnitude && Vector2.Dot(step, setpointError) > 0f)
+            {
+                step = setpointError;
+                this.setpointAcceleration = Vector2.zero;
+            }
+            this.brakeVelocitySetpoint += step;
+            // The ramp's acceleration is fed forward, as PX4 does with the trajectory setpoint.
+            Vector2 accelerationFeedForward = this.positionLocked ? Vector2.zero : step / dt;
+            if (!horizontalInput && !this.positionLocked && this.brakeVelocitySetpoint == Vector2.zero && horizontalVelocity.magnitude < PositionLockSpeed)
             {
                 this.positionLocked = true;
                 this.lockedPosition = position;
             }
 
-            Vector2 velocitySetpoint = this.positionLocked ? this.xyP * (this.lockedPosition - position) : this.brakeVelocitySetpoint;
-            velocitySetpoint = Vector2.ClampMagnitude(velocitySetpoint, this.xyVelMax);
+            Vector2 velocitySetpoint = this.positionLocked
+                ? Vector2.ClampMagnitude(this.xyP * (this.lockedPosition - position), this.xyVelMax)
+                : this.brakeVelocitySetpoint;
             Vector2 velocityError = velocitySetpoint - horizontalVelocity;
             Vector2 integral = new Vector2(this.velIntegral.x, this.velIntegral.z);
-            Vector2 accelerationXY = this.xyVelP * velocityError + integral - this.xyVelD * new Vector2(acceleration.x, acceleration.z);
+            Vector2 accelerationXY = accelerationFeedForward + this.xyVelP * velocityError + integral - this.xyVelD * new Vector2(acceleration.x, acceleration.z);
             integral = Vector2.ClampMagnitude(integral + this.xyVelI * velocityError * dt, gravity * Mathf.Tan(this.tiltMax));
             this.velIntegral.x = integral.x;
             this.velIntegral.z = integral.y;
@@ -670,7 +744,7 @@ public class Flight : DroneModule
 
         // Collective thrust (N).
         float desiredTotalThrust;
-        if (verticalInput)
+        if (directThrust)
         {
             // As before: hover + offset, with a capped tilt compensation.
             desiredTotalThrust = hoverThrust + this.VerticalSpeed * scale * maxVerticalThrustFraction * hoverThrust;
@@ -1028,6 +1102,12 @@ public class Flight : DroneModule
         this.tiltMax = FlightConfig.Px4("MPC_TILTMAX_AIR") * Mathf.Deg2Rad;
         this.thrMin = FlightConfig.Px4("MPC_THR_MIN");
         this.thrMax = FlightConfig.Px4("MPC_THR_MAX");
+        this.velManual = KeyboardMaxSpeed;
+        this.jerkMax = FlightConfig.Px4("MPC_JERK_MAX");
+        this.accHorMax = FlightConfig.Px4("MPC_ACC_HOR_MAX");
+        this.manualYawRate = FlightConfig.Px4("MPC_MAN_Y_MAX");
+        this.accUpMax = FlightConfig.Px4("MPC_ACC_UP_MAX");
+        this.accDownMax = FlightConfig.Px4("MPC_ACC_DOWN_MAX");
         ResetPositionController();
 
         this.angularDragCoeff = FlightConfig.Sim("angularDragCoeff");

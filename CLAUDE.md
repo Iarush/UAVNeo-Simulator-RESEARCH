@@ -79,8 +79,9 @@ Spec: `.plans/real-flight-physics-spec.md`; results in DEVLOG 2026-10-20.
 - **Config:** `FlightConfig` reads `UAVSim/Assets/StreamingAssets/Flight/uav-neo.params` (the real drone's PX4 v1.17.0 params, made by `tools/extract-px4-params.py` from QGC `.tlog` files) and `flight-sim.json` (sim-only values, each with its source). Rate-loop gains are PX4 stock, never the file's. Exceptions decided by the owner: `MC_ROLL_P` / `MC_PITCH_P` 6.5, and yaw 1.0 = 1 rad/s.
 - **Motors:** sized so hover is at `MPC_THR_HOVER`; first-order lag (12.5 / 25 ms); one force per motor at its position; yaw reaction from spin direction. Motor index order is FR 0, FL 1, BL 2, BR 3 (`MotorQuadrants.MotorIndex`).
 - **Motor positions:** custom frames use the propeller transforms (placed by `CustomFrameLoader`). The stock drone uses an X layout from `armLength` (0.16 m), because its propeller visuals sit at about ±0.72 m and do not match its physics.
-- **Still old (phases 2–5):** position hold, banking, altitude PD, kinematic launch, drags and brake. Lab regression is deferred to the end.
-- **Tests:** `UAVSim/Assets/Tests/PlayMode/FlightConfigTests.cs`, `FlightMotorTests.cs` (the `Baseline` category is the slow 20 s, 5-frame hover trace).
+- **Phase 2 (done 2026-10-20):** PX4 velocity/position and vertical loops; released sticks brake by tilting (setpoint ramp at `MPC_ACC_HOR`) then lock position; banking, brake drags, velocity snap and yaw velocity rotation removed. Tests in `Tests/PlayMode/FlightControlTests.cs`.
+- **Still old (phases 3–5):** keyboard uses the `send_pcmd` path (no POSCTL yet), kinematic launch (`KinematicLaunchStep`), simple drag. Lab regression is deferred to the end.
+- **Tests:** `UAVSim/Assets/Tests/PlayMode/FlightConfigTests.cs`, `FlightMotorTests.cs` (the `Baseline` category is the slow 20 s, 5-frame hover trace), `FlightControlTests.cs` (phase 2), `FlightPosCtlTests.cs` (phase 3). Run them with the Unity CLI, not Unity MCP (owner decision 2026-10-20), with the Editor closed: `"C:\Program Files\Unity\Hub\Editor\6000.4.5f1\Editor\Unity.exe" -batchmode -projectPath UAVSim -runTests -testPlatform PlayMode -testFilter <regex> -testResults <xml> -logFile <log>`.
 
 ## Wire protocol (LOCKED — do not change either side)
 
