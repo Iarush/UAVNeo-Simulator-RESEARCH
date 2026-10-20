@@ -559,8 +559,23 @@ public class LevelManager : MonoBehaviour
         }
     }
 
+    /// <summary>The simulation mode whose input path was last given to the drones' Flight.</summary>
+    private SimulationMode? flightModeAppliedFor;
+
     private void Update()
     {
+        // The one place that decides who flies: keyboard/controller in default flight
+        // (PX4 position mode), Python send_pcmd otherwise. Applied only when the mode changes.
+        if (this.flightModeAppliedFor != this.simulationMode)
+        {
+            this.flightModeAppliedFor = this.simulationMode;
+            Flight.ControlMode mode = this.simulationMode == SimulationMode.DefaultFlight ? Flight.ControlMode.PosCtl : Flight.ControlMode.Pcmd;
+            foreach (Drone player in this.players)
+            {
+                player.Flight.Mode = mode;
+            }
+        }
+
         switch (this.simulationMode)
         {
             case SimulationMode.DefaultFlight:

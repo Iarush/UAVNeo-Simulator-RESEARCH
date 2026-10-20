@@ -452,7 +452,12 @@ namespace UAVSim.Tests.PlayMode
                 yield return FastSteps(10);
             Time.timeScale = 1f;
             Assert.IsFalse((bool)Get(flight, "IsLaunching"), "Launch never finished");
+            // Flight-model tests drive the send_pcmd path unless they choose PosCtl.
+            SetMode("Pcmd");
         }
+
+        private void SetMode(string mode) =>
+            Set(flight, "Mode", Enum.Parse(GameType("Flight").GetNestedType("ControlMode"), mode));
 
         /// <summary>n physics steps at one step per frame (for sampling every step).</summary>
         private static IEnumerator Steps(int n)

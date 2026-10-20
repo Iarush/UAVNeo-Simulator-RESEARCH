@@ -48,6 +48,64 @@ implement custom `.stl` drone import:
 
 ---
 
+## 2026-10-20 — Real flight physics, phase 2 (PX4 velocity/position loops, velocity overrides removed)
+
+Spec: `.plans/real-flight-physics-spec.md` §4.3, §4.4 (`Pcmd` path), §4.6.
+
+**Changed (`Flight.cs`):**
+- With no horizontal input the drone holds position the PX4 way. The velocity setpoint ramps from the
+  current velocity to zero at `MPC_ACC_HOR` (3 m/s²). Once it is zero and the speed is below 0.1 m/s, the
+  position locks. The PX4 velocity PID (`MPC_XY_VEL_P/I/D_ACC`) plus the ramp's acceleration fed forward
+  (as PX4 does with its trajectory setpoint) gives an acceleration, which sets the thrust axis (tilt limit
+  `MPC_TILTMAX_AIR`) at the held heading.
+- Altitude hold uses the PX4 vertical loop (`MPC_Z_P`, `MPC_Z_VEL_P/I/D_ACC`, climb and descent limited by
+  `MPC_Z_VEL_MAX_UP/DN`). Collective thrust is hover-normalised, divided by the setpoint tilt and kept
+  within `MPC_THR_MIN/MAX`. A non-zero throttle input still gives a thrust offset, as before.
+- Tilt input keeps its `send_pcmd` meaning: pitch/roll = value × `pcmdMaxTiltDeg` (35°) × `MaxSpeed`.
+  Yaw 1.0 = 1 rad/s. The heading is held when yaw is released. Banking is removed.
+- Removed: velocity rotation during yaw, cross-brake and reverse-brake drag, position-hold brake drag, the
+  0.08 m/s velocity snap, and the angular-velocity write clamp (`rBody.maxAngularVelocity` stays as the
+  engine cap). Drag is now plain quadratic horizontal and linear vertical; frame-scaled drag comes in phase 5.
+- The kinematic launch moved into `KinematicLaunchStep()`, unchanged. It, `Arm()` and `FinishDisarm()`
+  still write velocities until phase 4. `Relaunch()` (respawn) is the permanent exception.
+- Pure vertical `send_pcmd` now holds position instead of forcing level with no hold (spec open item 5).
+
+**Tests (Unity CLI, batch mode, Editor closed; owner decision 2026-10-20 to use the CLI instead of
+Unity MCP):** FlightConfigTests + FlightMotorTests without Baseline and the phase 3 tests:
+**21 passed, 0 failed, 0 ignored.** New tests are in `Tests/PlayMode/FlightControlTests.cs`, a partial
+class of `FlightMotorTests`. Command:
+`Unity.exe -batchmode -projectPath UAVSim -runTests -testPlatform PlayMode -testFilter "^UAVSim\.Tests\.PlayMode\.(FlightConfigTests|FlightMotorTests\.(?!PosCtl|Pcmd_Unchanged|Baseline))" -testResults <xml> -logFile <log>`.
+- `NoVelocityWritesInFlight`: writes only in Arm, Relaunch, FinishDisarm and KinematicLaunchStep. The
+  runtime probe's largest velocity change was 0.882 × the force-implied limit.
+- `PcmdTilt_StepResponse`: pitch 0.5 → 8.74° (target 8.75°). 63% at 145 ms (expected 154 ms ±25%),
+  overshoot −0.1%, max pitch rate 46.7°/s (limit 220).
+- `PcmdYaw_RateAndNoBank`: 57.19°/s (expected 57.30), max roll 0.000°.
+- `TurnKeepsMomentum`: peak angle between velocity and heading 58.9°, 28.8° 2 s after the turn.
+- `Hold_StopsByTilting`: released at 1.00 m/s. Peak deceleration 3.02 m/s² (`MPC_ACC_HOR` 3.0; limit
+  5.5), stopping distance 0.384 m (minimum 0.101), up to 17.6° nose-up, moved 2.4 cm between 5 s and 8 s.
+  Before the acceleration feed-forward the same test braked at only 1.42 m/s², took 0.827 m and still
+  moved 8.1 cm while settling.
+- `LightFrames_DoNotClimbAway`: yaw-light 1.2 kg and small 0.28 kg both hover at u 0.5000, altitude error
+  0.10 cm, tilt 0.000°.
+- `Saturation_YawGivesWayFirst`: roll alone 2.2198 N·m; roll + yaw gives roll 2.2198 N·m and yaw 0.0000
+  N·m (yaw alone 0.9810).
+- Phase 1 tests still pass: default/cube/7-inch hover at u 0.5000; lever rule 59.80% vs 59.80%; sign
+  checks; crash by corner.
+
+**Baseline hover traces** (Editor run, same phase 2 controller before the feed-forward, which does not act
+in a steady hover): 20 s hover, max altitude error / drift / tilt: default drone 9.11 mm / 0.01 mm / 0.000°,
+cube 8.83 / 0.00 / 0.000°, 7-inch 8.78 / 0.12 / 0.000°, yaw-light 1.2 kg 8.87 / 0.00 / 0.000°, small 0.28 kg
+8.87 / 0.00 / 0.000°. The largest error is at t = 0, right after the kinematic launch hands over, and it decays
+below 0.05 mm by 10 s.
+
+**Not run:** the lab regression report (deferred to the end, owner decision 2026-10-20) and a hand flight.
+
+**Also in the working tree, not part of phase 2:** the phase 3 keyboard path (`Flight.ControlMode`, set in
+`LevelManager.Update` when the simulation mode changes) and `Tests/PlayMode/FlightPosCtlTests.cs`. Its last
+Editor run, before the feed-forward, failed 5 tests on a 7–8% speed and climb overshoot; not re-run since.
+
+---
+
 ## 2026-10-20 — Real flight physics, phases 0 and 1 (branch `feature/real-flight-physics`)
 
 Spec: `.plans/real-flight-physics-spec.md`. All tests run through Unity MCP in the
