@@ -24,7 +24,7 @@ namespace UAVSim.Tests.PlayMode
     /// Motor order everywhere: FR 0, FL 1, BL 2, BR 3.
     /// </summary>
     [Timeout(900000)]
-    public class FlightMotorTests
+    public partial class FlightMotorTests
     {
         private const int ServicePort = 5070;
         private static readonly string[] Corner = { "FR", "FL", "BL", "BR" };

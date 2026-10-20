@@ -14,12 +14,11 @@ using UnityEngine;
 ///   - Translational dynamics: gravity + thrust (rotated to global frame) + aerodynamic drag
 ///   - Rotational dynamics: motor torques + propeller gyroscopic effects
 ///     (rigid-body gyroscopic term wxIw is handled by Unity's Rigidbody inertia tensor)
-///   - PD attitude stabilization controller (inner loop) with properly tuned gains
-///   - Motor saturation handling (attitude priority over altitude)
-///   - Angular velocity safety limiting
-///   - Position hold mode: active velocity damping when no horizontal input
-///   - Altitude hold mode: PD altitude controller when no vertical input
-///   - Arm/disarm state: motors off until armed, auto-launch on first arm
+///   - PX4 v1.17.0 attitude and rate loops, allocation with MC_AIRMODE 0 desaturation (phase 1)
+///   - PX4 velocity/position loops (phase 2): with no horizontal input the drone brakes by
+///     tilting (velocity setpoint ramped to zero at MPC_ACC_HOR) and then holds position;
+///     altitude hold through the PX4 vertical loop. Nothing writes the velocity in flight.
+///   - Arm/disarm state: motors off until armed, auto-launch on first arm (kinematic until phase 4)
 ///
 /// The user-facing API remains unchanged: ForwardSpeed, StrafeSpeed, VerticalSpeed,
 /// YawSpeed as [-1, 1] inputs, plus MaxSpeed as a scaling factor.
@@ -143,13 +142,38 @@ public class Flight : DroneModule
     /// <summary>PX4 ControlAllocationSequentialDesaturation: extra yaw headroom.</summary>
     private const float MinimumYawMargin = 0.15f;
 
+    // --------- PX4 velocity and position loops (spec phase 2) ---------
+    // PX4 v1.17.0 src/modules/mc_pos_control/PositionControl/PositionControl.cpp. The MPC_* values
+    // come from the real drone's params file (they equal the PX4 defaults). World axes: y is up.
+
+    private float xyP, xyVelP, xyVelI, xyVelD;   // MPC_XY_P, MPC_XY_VEL_P/I/D_ACC
+    private float zP, zVelP, zVelI, zVelD;       // MPC_Z_P, MPC_Z_VEL_P/I/D_ACC
+    private float xyVelMax, zVelMaxUp, zVelMaxDown, accHor, tiltMax, thrMin, thrMax;
+    private Vector3 velIntegral;                 // m/s^2
+    private Vector3 previousVelocity;
+    private bool haveVelocity;
+
+    /// <summary>Hold: velocity setpoint ramped to zero at MPC_ACC_HOR, then a position lock.</summary>
+    private bool holding;
+    private Vector2 brakeVelocitySetpoint;
+    private bool positionLocked;
+    private Vector2 lockedPosition;
+
+    /// <summary>Heading (deg) held while there is no yaw input; NaN while yawing.</summary>
+    private float yawLock = float.NaN;
+
+    /// <summary>Stick values below this count as released (as before).</summary>
+    private const float StickDeadband = 0.05f;
+
+    /// <summary>The position lock engages once the brake setpoint is zero and the speed is below this (m/s).</summary>
+    private const float PositionLockSpeed = 0.1f;
+
     // --------- User Input Limits ---------
 
     /// <summary>
-    /// Maximum tilt angle the user can command (degrees).
-    /// 35Â° at full scale â†’ ~35 m/s terminal velocity.
+    /// send_pcmd tilt (degrees) at 1.0 x MaxSpeed (flight-sim.json pcmdMaxTiltDeg).
     /// </summary>
-    private const float maxTiltAngle = 35f;
+    private float maxTiltAngle = 35f;
 
     /// <summary>
     /// Maximum yaw rate the user can command (degrees/second), from flight-sim.json
@@ -174,61 +198,10 @@ public class Flight : DroneModule
     /// </summary>
     private const float maxTiltCompensation = 1.15f;
 
-    /// <summary>
-    /// Maximum bank (roll) angle induced by yaw input for coordinated turns (degrees).
-    /// Creates a natural banking feeling during yaw rotation, coupling yaw and roll
-    /// like a real aircraft. Scales with MaxSpeed.
-    /// </summary>
-    private const float bankAngle = 15f;
+    // --------- Launch (kinematic until spec phase 4) ---------
 
-    // --------- Position Hold ---------
-
-    /// <summary>
-    /// Gain for velocity-based position hold (normalized input per m/s of raw velocity).
-    /// When no horizontal stick input, the drone tilts to oppose its velocity.
-    /// At 2 m/s raw: input = 1.2 -> clamped to 1.0 -> max tilt -> aggressive braking.
-    /// </summary>
-    private const float posHoldVelGain = 0.60f;
-
-    /// <summary>
-    /// Heavy linear drag applied in the horizontal plane when no stick input.
-    /// This simulates the drone's flight controller actively braking.
-    /// </summary>
-    private const float posHoldBrakeDrag = 4.5f;
-
-    /// <summary>
-    /// Extra drag applied when the stick direction opposes the current velocity.
-    /// This lets the drone decelerate hard on direction changes without reducing top speed.
-    /// </summary>
-    private const float reverseBrakeDrag = 2.5f;
-
-    /// <summary>
-    /// Heavy linear drag applied to the velocity component PERPENDICULAR to stick input.
-    /// When the pilot changes direction (e.g. forward â†’ right), this kills the unwanted
-    /// cross-velocity almost instantly, giving razor-sharp directional control without
-    /// affecting acceleration or top speed in the desired direction.
-    /// </summary>
-    private const float crossBrakeDrag = 6.0f;
-
-    /// <summary>
-    /// Horizontal speed (m/s) below which the drone snaps to a full stop.
-    /// Prevents tiny residual drift after braking.
-    /// </summary>
-    private const float posHoldDeadZone = 0.08f;
-
-    // --------- Altitude Hold ---------
-
-    /// <summary>
-    /// Proportional gain for altitude hold (thrust fraction per meter of altitude error).
-    /// At 1m below target: 0.5 * hoverThrust extra -> steady climb.
-    /// Clamped to maxVerticalThrustFraction.
-    /// </summary>
+    /// <summary>Launch ascent speed gains (m/s per m of altitude error, per m/s of climb).</summary>
     private const float Kp_alt = 0.5f;
-
-    /// <summary>
-    /// Derivative gain for altitude hold (thrust fraction per m/s of vertical velocity).
-    /// Damps vertical oscillation around target altitude.
-    /// </summary>
     private const float Kd_alt = 0.8f;
 
     // --------- Launch ---------
@@ -350,6 +323,7 @@ public class Flight : DroneModule
         this.rBody.linearVelocity = Vector3.zero;
         this.rBody.angularVelocity = Vector3.zero;
         this.transform.rotation = Quaternion.Euler(0f, this.transform.eulerAngles.y, 0f);
+        ResetPositionController();
 
         Debug.Log($"[Flight] Armed! Launching to altitude {TargetAltitude:F1}m");
     }
@@ -366,9 +340,10 @@ public class Flight : DroneModule
         groundY = this.transform.position.y;
         TargetAltitude = this.transform.position.y + launchAltitude;
 
-        // Clean start for relaunch
+        // Clean start for relaunch (a respawn is a teleport)
         this.rBody.linearVelocity = Vector3.zero;
         this.rBody.angularVelocity = Vector3.zero;
+        ResetPositionController();
 
         Debug.Log($"[Flight] Relaunching to altitude {TargetAltitude:F1}m");
     }
@@ -578,184 +553,139 @@ public class Flight : DroneModule
         // 1. READ CURRENT STATE
         // ================================================================
 
-        Vector3 euler = this.transform.eulerAngles;
-        float currentPitch = NormalizeAngle(euler.x);
-        float currentRoll = NormalizeAngle(euler.z);
-
-        Vector3 angVelWorld = this.rBody.angularVelocity;
-        Vector3 angVelBody = this.transform.InverseTransformDirection(angVelWorld);
+        float dt = Time.fixedDeltaTime;
+        Vector3 angVelBody = this.transform.InverseTransformDirection(this.rBody.angularVelocity);
         float p = angVelBody.x; // pitch rate
-        float q = angVelBody.y; // yaw rate
         float r = angVelBody.z; // roll rate
 
-        // ================================================================
-        // 2. SAFETY: ANGULAR VELOCITY LIMITING
-        // ================================================================
-        float angVelMag = angVelBody.magnitude;
-        if (angVelMag > maxAngularVelocity)
-        {
-            this.rBody.angularVelocity = this.rBody.angularVelocity * (maxAngularVelocity / angVelMag);
-            angVelWorld = this.rBody.angularVelocity;
-            angVelBody = this.transform.InverseTransformDirection(angVelWorld);
-            p = angVelBody.x;
-            q = angVelBody.y;
-            r = angVelBody.z;
-        }
+        Vector3 velocity = this.rBody.linearVelocity;
+        Vector3 acceleration = this.haveVelocity ? (velocity - this.previousVelocity) / dt : Vector3.zero;
+        this.previousVelocity = velocity;
+        this.haveVelocity = true;
 
         // ================================================================
-        // 2b. LAUNCH STABILIZATION: kinematic ascent to target altitude.
-        //     Bypasses the physics engine entirely â€” directly sets position,
-        //     rotation, and velocity each frame. This eliminates the
-        //     limit-cycle oscillation caused by MoveRotation fighting motor
-        //     torques on a non-kinematic Rigidbody.
-        //
-        //     If the user provides any horizontal input, launch ends early
-        //     and normal motor-mixing takes over immediately.
+        // 2. LAUNCH: kinematic ascent until spec phase 4 replaces it with a physics takeoff.
+        //    Horizontal input ends the launch early.
         // ================================================================
         if (IsLaunching)
         {
-            bool userInput = Mathf.Abs(this.ForwardSpeed) > 0.05f || Mathf.Abs(this.StrafeSpeed) > 0.05f;
-            if (userInput)
+            if (Mathf.Abs(this.ForwardSpeed) >= StickDeadband || Mathf.Abs(this.StrafeSpeed) >= StickDeadband)
             {
                 IsLaunching = false;
-                Debug.Log("[Flight] User took over during launch â€” exiting launch stabilization");
-                // Fall through to normal motor mixing below
+                ResetPositionController();
+                Debug.Log("[Flight] User took over during launch - exiting launch stabilization");
             }
             else
             {
-                float altError = TargetAltitude - this.transform.position.y;
-                float vertVel = this.rBody.linearVelocity.y;
-
-                // Kinematic ascent: move drone directly upward, no physics forces
-                float launchSpeed = Mathf.Clamp(altError * Kp_alt - vertVel * Kd_alt, -maxVerticalThrustFraction * 5f, maxVerticalThrustFraction * 5f);
-                Vector3 newPos = this.transform.position + Vector3.up * launchSpeed * Time.fixedDeltaTime;
-
-                // Lock attitude flat at current yaw â€” directly set transform, no physics
-                float currentYaw = this.transform.eulerAngles.y;
-                this.rBody.Move(newPos, Quaternion.Euler(0f, currentYaw, 0f));
-
-                // Zero all physics velocities so no residual momentum fights us
-                this.rBody.linearVelocity = new Vector3(0f, launchSpeed, 0f);
-                this.rBody.angularVelocity = Vector3.zero;
-                ResetRateController();
-
-                // Telemetry only: hold each motor at its share of hover thrust (lever rule), so
-                // the lag model starts from hover when the launch hands over to the motors.
-                float launchHoverThrust = this.rBody.mass * Physics.gravity.magnitude;
-                for (int i = 0; i < 4; i++)
-                {
-                    float t = Mathf.Clamp(this.allocation[i, 0] * launchHoverThrust, 0f, this.motorThrustMax);
-                    this.MotorThrusts[i] = t;
-                    this.MotorCommands[i] = t / this.motorThrustMax;
-                    this.MotorSpeeds[i] = Mathf.Clamp(Mathf.Sqrt(t / kf), motorSpeedMin, motorSpeedMax);
-                }
-
-                // Check if launch is complete
-                if (Mathf.Abs(altError) < 0.5f && Mathf.Abs(vertVel) < 0.5f)
-                {
-                    IsLaunching = false;
-                    TargetAltitude = this.transform.position.y;
-                    Debug.Log("[Flight] Launch complete - entering altitude hold");
-                }
-
-                return; // Skip motor mixing â€” kinematic launch handles everything
+                KinematicLaunchStep();
+                return;
             }
         }
-
-        // ================================================================
-        // 3. POSITION HOLD: when no horizontal input, oppose velocity
-        // ================================================================
-        float effectiveForward = this.ForwardSpeed;
-        float effectiveStrafe = this.StrafeSpeed;
-
-        bool noHorizontalInput = Mathf.Abs(this.ForwardSpeed) < 0.05f && Mathf.Abs(this.StrafeSpeed) < 0.05f;
-        bool noVerticalInput = Mathf.Abs(this.VerticalSpeed) < 0.05f;
-        bool pureVerticalFlight = noHorizontalInput && !noVerticalInput;
-
-        if (noHorizontalInput && !pureVerticalFlight)
-        {
-            // Convert world velocity to body-frame horizontal components
-            Vector3 localVel = this.transform.InverseTransformDirection(this.rBody.linearVelocity);
-
-            // Oppose forward velocity with pitch, lateral velocity with roll
-            // localVel.z = forward speed in body frame, localVel.x = right speed
-            effectiveForward = Mathf.Clamp(-localVel.z * posHoldVelGain, -1f, 1f);
-            effectiveStrafe = Mathf.Clamp(-localVel.x * posHoldVelGain, -1f, 1f);
-        }
-        else if (pureVerticalFlight)
-        {
-            // Pure vertical flight (Shift held, no WASD): force level attitude.
-            // Position hold tilt at high vertical speeds can cause oscillation/instability.
-            // Drag alone handles any horizontal drift; PD controller keeps it level.
-            effectiveForward = 0f;
-            effectiveStrafe = 0f;
-        }
-
-        // ================================================================
-        // 4. COMPUTE DESIRED STATE FROM INPUTS
-        // ================================================================
 
         float scale = this.MaxSpeed;
-
-        // Forward input -> desired pitch angle
-        float desiredPitch = effectiveForward * maxTiltAngle * scale;
-
-        // Strafe input -> desired roll angle
-        float desiredRoll = -effectiveStrafe * maxTiltAngle * scale;
-
-        // Yaw input -> desired yaw rate (always full authority, independent of speed scale)
-        float desiredYawRate = this.YawSpeed * maxYawRate * Mathf.Deg2Rad;
-
-        // Banking: yaw input induces a coordinated roll into the turn.
-        // Positive YawSpeed (right) â†’ negative desiredRoll (bank right).
-        desiredRoll -= this.YawSpeed * bankAngle * scale;
-
-        // ================================================================
-        // 5. ALTITUDE HOLD / VERTICAL THRUST
-        // ================================================================
-
         float gravity = Physics.gravity.magnitude;
-        float hoverThrust = this.rBody.mass * gravity;
-        float thrustOffset;
+        float mass = this.rBody.mass;
+        float hoverThrust = mass * gravity;
+        float heading = this.transform.eulerAngles.y;
+        bool horizontalInput = Mathf.Abs(this.ForwardSpeed) >= StickDeadband || Mathf.Abs(this.StrafeSpeed) >= StickDeadband;
+        bool verticalInput = Mathf.Abs(this.VerticalSpeed) >= StickDeadband;
 
-        if (noVerticalInput)
+        // ================================================================
+        // 3. YAW (send_pcmd meaning): yaw 1.0 = pcmdMaxYawRateDegS about world up, no banking.
+        //    The heading is held when the yaw input is released.
+        // ================================================================
+        float desiredYawRate = this.YawSpeed * maxYawRate * Mathf.Deg2Rad;
+        if (this.YawSpeed != 0f)
+            this.yawLock = float.NaN;
+        else if (float.IsNaN(this.yawLock))
+            this.yawLock = heading;
+        float yawSetpoint = float.IsNaN(this.yawLock) ? heading : this.yawLock;
+
+        // ================================================================
+        // 4. VERTICAL: throttle input = thrust offset (as before); released = PX4 altitude hold
+        //    (PositionControl _positionControl/_velocityControl, z axis), climb and descent
+        //    limited by MPC_Z_VEL_MAX_UP/DN.
+        // ================================================================
+        float accelerationUp = 0f;
+        if (verticalInput)
         {
-            // PD altitude hold: maintain TargetAltitude
-            float altError = TargetAltitude - this.transform.position.y;
-            float vertVel = this.rBody.linearVelocity.y;
-
-            float altFraction = Kp_alt * altError - Kd_alt * vertVel;
-            altFraction = Mathf.Clamp(altFraction, -maxVerticalThrustFraction, maxVerticalThrustFraction);
-            thrustOffset = altFraction * hoverThrust;
-
-            // If launching and close to target, end launch phase
-            if (IsLaunching && Mathf.Abs(altError) < 0.5f && Mathf.Abs(vertVel) < 0.5f)
-            {
-                IsLaunching = false;
-                Debug.Log("[Flight] Launch complete - entering altitude hold");
-            }
+            TargetAltitude = this.transform.position.y;
+            this.velIntegral.y = 0f;
         }
         else
         {
-            // User commanding vertical motion: normal thrust
-            thrustOffset = this.VerticalSpeed * scale * maxVerticalThrustFraction * hoverThrust;
-
-            // Continuously update target altitude so that when the user releases
-            // the stick, altitude hold kicks in at the current altitude.
-            TargetAltitude = this.transform.position.y;
+            float vzSetpoint = Mathf.Clamp(this.zP * (TargetAltitude - this.transform.position.y), -this.zVelMaxDown, this.zVelMaxUp);
+            float vzError = vzSetpoint - velocity.y;
+            accelerationUp = this.zVelP * vzError + this.velIntegral.y - this.zVelD * acceleration.y;
+            this.velIntegral.y = Mathf.Clamp(this.velIntegral.y + this.zVelI * vzError * dt, -gravity, gravity);
         }
 
-        float desiredTotalThrust = hoverThrust + thrustOffset;
-
-        // Gentle tilt compensation
-        float cosRoll = Mathf.Cos(currentRoll * Mathf.Deg2Rad);
-        float cosPitch = Mathf.Cos(currentPitch * Mathf.Deg2Rad);
-        float tiltFactor = cosRoll * cosPitch;
-        if (tiltFactor > 0.01f)
+        // ================================================================
+        // 5. HORIZONTAL -> ATTITUDE SETPOINT
+        //    Tilt input (send_pcmd meaning): pitch/roll = value x pcmdMaxTiltDeg x MaxSpeed.
+        //    Released: hold. The velocity setpoint ramps from the current velocity to zero at
+        //    MPC_ACC_HOR, then the position locks; the PX4 velocity loop turns that into an
+        //    acceleration, so the drone stops only by tilting.
+        // ================================================================
+        Quaternion attitudeSetpoint;
+        if (horizontalInput)
         {
-            float compensation = Mathf.Min(1f / tiltFactor, maxTiltCompensation);
-            desiredTotalThrust *= compensation;
+            this.holding = false;
+            this.positionLocked = false;
+            this.velIntegral.x = this.velIntegral.z = 0f;
+            float desiredPitch = this.ForwardSpeed * maxTiltAngle * scale;
+            float desiredRoll = -this.StrafeSpeed * maxTiltAngle * scale;
+            attitudeSetpoint = Quaternion.Euler(desiredPitch, yawSetpoint, desiredRoll);
         }
+        else
+        {
+            Vector2 horizontalVelocity = new Vector2(velocity.x, velocity.z);
+            Vector2 position = new Vector2(this.transform.position.x, this.transform.position.z);
+            if (!this.holding)
+            {
+                this.holding = true;
+                this.brakeVelocitySetpoint = horizontalVelocity;
+            }
+            this.brakeVelocitySetpoint = Vector2.MoveTowards(this.brakeVelocitySetpoint, Vector2.zero, this.accHor * dt);
+            if (!this.positionLocked && this.brakeVelocitySetpoint == Vector2.zero && horizontalVelocity.magnitude < PositionLockSpeed)
+            {
+                this.positionLocked = true;
+                this.lockedPosition = position;
+            }
+
+            Vector2 velocitySetpoint = this.positionLocked ? this.xyP * (this.lockedPosition - position) : this.brakeVelocitySetpoint;
+            velocitySetpoint = Vector2.ClampMagnitude(velocitySetpoint, this.xyVelMax);
+            Vector2 velocityError = velocitySetpoint - horizontalVelocity;
+            Vector2 integral = new Vector2(this.velIntegral.x, this.velIntegral.z);
+            Vector2 accelerationXY = this.xyVelP * velocityError + integral - this.xyVelD * new Vector2(acceleration.x, acceleration.z);
+            integral = Vector2.ClampMagnitude(integral + this.xyVelI * velocityError * dt, gravity * Mathf.Tan(this.tiltMax));
+            this.velIntegral.x = integral.x;
+            this.velIntegral.z = integral.y;
+
+            // ControlMath::limitTilt + bodyzToAttitude: thrust axis from the horizontal acceleration.
+            Vector3 bodyUp = new Vector3(accelerationXY.x, gravity, accelerationXY.y).normalized;
+            bodyUp = Vector3.RotateTowards(Vector3.up, bodyUp, this.tiltMax, 0f);
+            attitudeSetpoint = AttitudeFromThrustAxis(bodyUp, yawSetpoint);
+        }
+
+        // Collective thrust (N).
+        float desiredTotalThrust;
+        if (verticalInput)
+        {
+            // As before: hover + offset, with a capped tilt compensation.
+            desiredTotalThrust = hoverThrust + this.VerticalSpeed * scale * maxVerticalThrustFraction * hoverThrust;
+            float tiltFactor = Vector3.Dot(this.transform.up, Vector3.up);
+            if (tiltFactor > 0.01f)
+                desiredTotalThrust *= Mathf.Min(1f / tiltFactor, maxTiltCompensation);
+        }
+        else
+        {
+            // PX4 _accelerationControl: hover-normalised, divided by the setpoint tilt, MPC_THR_MIN/MAX.
+            float cosTilt = Mathf.Max(Vector3.Dot(attitudeSetpoint * Vector3.up, Vector3.up), 0.1f);
+            desiredTotalThrust = mass * (gravity + accelerationUp) / cosTilt;
+        }
+        float allMotors = 4f * this.motorThrustMax;
+        desiredTotalThrust = Mathf.Clamp(desiredTotalThrust, this.thrMin * allMotors, this.thrMax * allMotors);
 
         // ================================================================
         // 6. PX4 ATTITUDE LOOP (once per FixedUpdate) -> RATE SETPOINT
@@ -765,7 +695,6 @@ public class Flight : DroneModule
         // ================================================================
 
         Quaternion attitude = this.transform.rotation;
-        Quaternion attitudeSetpoint = Quaternion.Euler(desiredPitch, euler.y, desiredRoll);
         Vector3 rateSetpoint = AttitudeControl(attitude, attitudeSetpoint, desiredYawRate);
 
         // ================================================================
@@ -831,99 +760,73 @@ public class Flight : DroneModule
         Vector3 propGyro = JTP * Omega_r * new Vector3(-r, 0f, p);
         this.rBody.AddRelativeTorque(propGyro);
 
-        // â”€â”€ Aerodynamic drag (velocity-decomposed) â”€â”€
-        // Horizontal velocity is split into a component ALIGNED with the stick
-        // direction and a CROSS (perpendicular) component.
-        //  â€¢ Aligned: quadratic drag â†’ near-zero at low speed (explosive accel),
-        //    strong at terminal velocity (caps top speed).
-        //  â€¢ Cross: heavy linear drag â†’ kills unwanted sideways momentum almost
-        //    instantly â†’ razor-sharp direction changes.
-        // Vertical drag remains simple linear.
-
-        Vector3 vel = this.rBody.linearVelocity;
-        float hSpeed = Mathf.Sqrt(vel.x * vel.x + vel.z * vel.z);
-        Vector3 dragForce;
-
-        if (noHorizontalInput)
-        {
-            // Position hold: strong LINEAR braking drag (constant deceleration feel)
-            float brakeDrag = posHoldBrakeDrag;
-
-            // Dead zone: snap to zero when nearly stopped
-            if (hSpeed < posHoldDeadZone)
-            {
-                this.rBody.linearVelocity = new Vector3(0f, vel.y, 0f);
-                vel = this.rBody.linearVelocity;
-            }
-
-            dragForce = new Vector3(
-                -brakeDrag * vel.x,
-                -dragY * vel.y,
-                -brakeDrag * vel.z
-            );
-        }
-        else
-        {
-            // Active flight: decompose horizontal velocity
-            Vector3 velXZ = new Vector3(vel.x, 0f, vel.z);
-            Vector3 stickWorld = this.transform.forward * this.ForwardSpeed
-                               + this.transform.right * this.StrafeSpeed;
-            stickWorld.y = 0f; // Project to horizontal plane â€” transform.forward tilts with the drone
-
-            if (stickWorld.sqrMagnitude > 0.001f && velXZ.sqrMagnitude > 0.01f)
-            {
-                Vector3 stickDir = stickWorld.normalized;
-                float speedXZ = velXZ.magnitude;
-                float alignedMag = Vector3.Dot(velXZ, stickDir);
-                Vector3 alignedVel = stickDir * alignedMag;
-                Vector3 crossVel = velXZ - alignedVel;
-
-                // Aligned component: quadratic drag (+ reverse brake if opposing)
-                float alignedCoeff = dragXZ * Mathf.Abs(alignedMag);
-                if (alignedMag < 0f) alignedCoeff += reverseBrakeDrag;
-
-                // Cross component: scale braking by how perpendicular the velocity is
-                // to the stick. When steering (W+D), velocity is mostly aligned â†’
-                // minimal cross-brake â†’ speed preserved. When doing a hard 90Â° swap
-                // (release W, press D only), velocity is fully perpendicular â†’ full brake.
-                float alignedFraction = Mathf.Clamp01(alignedMag / speedXZ);
-                float crossCoeff = crossBrakeDrag * (1f - alignedFraction);
-
-                Vector3 hDrag = -alignedCoeff * alignedVel - crossCoeff * crossVel;
-                dragForce = new Vector3(hDrag.x, -dragY * vel.y, hDrag.z);
-            }
-            else
-            {
-                // Negligible stick or velocity: fall back to simple quadratic
-                float coeff = dragXZ * hSpeed;
-                dragForce = new Vector3(-coeff * vel.x, -dragY * vel.y, -coeff * vel.z);
-            }
-        }
-
-        this.rBody.AddForce(dragForce);
+        // Aerodynamic drag: quadratic horizontal, linear vertical (frame-scaled drag is phase 5).
+        // No brake forces: the drone stops only by tilting.
+        float hSpeed = Mathf.Sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
+        this.rBody.AddForce(new Vector3(-dragXZ * hSpeed * velocity.x, -dragY * velocity.y, -dragXZ * hSpeed * velocity.z));
 
         // Aerodynamic angular drag
-        Vector3 angDrag = -angularDragCoeff * angVelBody;
-        this.rBody.AddRelativeTorque(angDrag);
+        this.rBody.AddRelativeTorque(-angularDragCoeff * angVelBody);
+    }
 
-        // ================================================================
-        // 10. MOMENTUM CONSERVATION DURING YAW
-        //     Rotate the horizontal velocity vector to follow the yaw rotation.
-        //     This preserves speed when turning â€” the drone redirects its
-        //     momentum instead of fighting drag to rebuild speed in a new direction.
-        // ================================================================
-        if (Mathf.Abs(this.YawSpeed) > 0.05f)
+    /// <summary>
+    /// Kinematic launch step (to be replaced by the physics takeoff in spec phase 4): moves the
+    /// drone straight up with rBody.Move and holds it level at its heading.
+    /// </summary>
+    private void KinematicLaunchStep()
+    {
+        float altError = TargetAltitude - this.transform.position.y;
+        float vertVel = this.rBody.linearVelocity.y;
+
+        float launchSpeed = Mathf.Clamp(altError * Kp_alt - vertVel * Kd_alt, -maxVerticalThrustFraction * 5f, maxVerticalThrustFraction * 5f);
+        Vector3 newPos = this.transform.position + Vector3.up * launchSpeed * Time.fixedDeltaTime;
+        this.rBody.Move(newPos, Quaternion.Euler(0f, this.transform.eulerAngles.y, 0f));
+
+        this.rBody.linearVelocity = new Vector3(0f, launchSpeed, 0f);
+        this.rBody.angularVelocity = Vector3.zero;
+        ResetRateController();
+
+        // Telemetry only: hold each motor at its share of hover thrust (lever rule), so
+        // the lag model starts from hover when the launch hands over to the motors.
+        float launchHoverThrust = this.rBody.mass * Physics.gravity.magnitude;
+        for (int i = 0; i < 4; i++)
         {
-            Vector3 currentVel = this.rBody.linearVelocity;
-            float hSpeedSq = currentVel.x * currentVel.x + currentVel.z * currentVel.z;
-            if (hSpeedSq > 0.1f)
-            {
-                float yawDeltaDeg = desiredYawRate * Mathf.Rad2Deg * Time.fixedDeltaTime;
-                Vector3 hVel = new Vector3(currentVel.x, 0f, currentVel.z);
-                Vector3 rotatedHVel = Quaternion.Euler(0f, yawDeltaDeg, 0f) * hVel;
-                this.rBody.linearVelocity = new Vector3(rotatedHVel.x, currentVel.y, rotatedHVel.z);
-            }
+            float t = Mathf.Clamp(this.allocation[i, 0] * launchHoverThrust, 0f, this.motorThrustMax);
+            this.MotorThrusts[i] = t;
+            this.MotorCommands[i] = t / this.motorThrustMax;
+            this.MotorSpeeds[i] = Mathf.Clamp(Mathf.Sqrt(t / kf), motorSpeedMin, motorSpeedMax);
         }
+
+        if (Mathf.Abs(altError) < 0.5f && Mathf.Abs(vertVel) < 0.5f)
+        {
+            IsLaunching = false;
+            TargetAltitude = this.transform.position.y;
+            ResetPositionController();
+            Debug.Log("[Flight] Launch complete - entering altitude hold");
+        }
+    }
+
+    /// <summary>
+    /// PX4 ControlMath::bodyzToAttitude: the attitude whose up axis is <paramref name="bodyUp"/>
+    /// and whose heading is <paramref name="yawDeg"/> (degrees about world up).
+    /// </summary>
+    private static Quaternion AttitudeFromThrustAxis(Vector3 bodyUp, float yawDeg)
+    {
+        Vector3 headingForward = Quaternion.Euler(0f, yawDeg, 0f) * Vector3.forward;
+        Vector3 right = Vector3.Cross(bodyUp, headingForward);
+        if (right.sqrMagnitude < 1e-8f) right = Quaternion.Euler(0f, yawDeg, 0f) * Vector3.right;
+        Vector3 forward = Vector3.Cross(right.normalized, bodyUp);
+        return Quaternion.LookRotation(forward, bodyUp);
+    }
+
+    /// <summary>Clears the hold, heading lock and velocity-loop state (arm, launch end, relaunch).</summary>
+    private void ResetPositionController()
+    {
+        this.velIntegral = Vector3.zero;
+        this.haveVelocity = false;
+        this.holding = false;
+        this.positionLocked = false;
+        this.yawLock = float.NaN;
     }
 
     /// <summary>
@@ -1108,6 +1011,24 @@ public class Flight : DroneModule
         this.rateD = Vector3.Scale(k, new Vector3(FlightConfig.Px4StockGains.PitchRateD, FlightConfig.Px4StockGains.YawRateD, FlightConfig.Px4StockGains.RollRateD));
         this.rateFF = new Vector3(FlightConfig.Px4StockGains.PitchRateFF, FlightConfig.Px4StockGains.YawRateFF, FlightConfig.Px4StockGains.RollRateFF);
         this.rateIntLim = new Vector3(FlightConfig.Px4StockGains.PitchRateIntLim, FlightConfig.Px4StockGains.YawRateIntLim, FlightConfig.Px4StockGains.RollRateIntLim);
+
+        this.maxTiltAngle = FlightConfig.Sim("pcmdMaxTiltDeg");
+        this.xyP = FlightConfig.Px4("MPC_XY_P");
+        this.xyVelP = FlightConfig.Px4("MPC_XY_VEL_P_ACC");
+        this.xyVelI = FlightConfig.Px4("MPC_XY_VEL_I_ACC");
+        this.xyVelD = FlightConfig.Px4("MPC_XY_VEL_D_ACC");
+        this.zP = FlightConfig.Px4("MPC_Z_P");
+        this.zVelP = FlightConfig.Px4("MPC_Z_VEL_P_ACC");
+        this.zVelI = FlightConfig.Px4("MPC_Z_VEL_I_ACC");
+        this.zVelD = FlightConfig.Px4("MPC_Z_VEL_D_ACC");
+        this.xyVelMax = FlightConfig.Px4("MPC_XY_VEL_MAX");
+        this.zVelMaxUp = FlightConfig.Px4("MPC_Z_VEL_MAX_UP");
+        this.zVelMaxDown = FlightConfig.Px4("MPC_Z_VEL_MAX_DN");
+        this.accHor = FlightConfig.Px4("MPC_ACC_HOR");
+        this.tiltMax = FlightConfig.Px4("MPC_TILTMAX_AIR") * Mathf.Deg2Rad;
+        this.thrMin = FlightConfig.Px4("MPC_THR_MIN");
+        this.thrMax = FlightConfig.Px4("MPC_THR_MAX");
+        ResetPositionController();
 
         this.angularDragCoeff = FlightConfig.Sim("angularDragCoeff");
         this.maxAngularVelocity = 1.5f * Mathf.Max(this.rateMax.x, Mathf.Max(this.rateMax.y, this.rateMax.z));

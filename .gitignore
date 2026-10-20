@@ -69,3 +69,10 @@ Assets/Imported/
 # Bundled Python for the mass-properties service: build output of tools/build-mass-service.ps1
 UAVSim/Assets/MassService~/python/
 __pycache__/
+
+# Generated code-graph output (too large for GitHub)
+UAVSim/graphify-out/
+
+# Stray Unity test scene
+UAVSim/Assets/InitTestScene*.unity
+UAVSim/Assets/InitTestScene*.unity.meta
