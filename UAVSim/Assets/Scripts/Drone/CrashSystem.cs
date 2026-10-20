@@ -519,7 +519,9 @@ public class CrashSystem : MonoBehaviour
 
         armGroupDetached[index] = true;
         propellerDetached[index] = true;
-        if (index < MotorHealth.Length) MotorHealth[index] = 0f;
+        // MotorHealth is in motor order (FR, FL, BL, BR), not Propeller_N order: use this arm's corner.
+        Vector3 armLocal = transform.InverseTransformPoint(propellerTransforms[index].position);
+        MotorHealth[MotorQuadrants.MotorIndex(MotorQuadrants.ClassifyUnity(armLocal))] = 0f;
 
         Vector3 propWorldPos = propellerTransforms[index].position;
         Vector3 awayDir = (propWorldPos - transform.position).normalized;

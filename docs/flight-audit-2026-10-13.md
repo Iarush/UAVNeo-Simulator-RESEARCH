@@ -141,7 +141,7 @@ unstable only below about **Iyy ≈ 0.0006 kg·m²** (was 0.00555), and roll/pit
 below about **0.00011 kg·m²** (was 0.00165). A very small frame (e.g. a sub-100 g
 whoop) could still hit it. Fix 2 would contain the climb in that case.
 
-### 2. LIMIT: heavier frames are underdamped (lead 2)
+### 2. LIMIT: heavier frames are underdamped (lead 2) — SUPERSEDED 2026-10-20 (real-flight-physics phase 1: PX4 rate and attitude loops replace the PD controller)
 
 Damping ratio ζ = (Kd + 0.005) / (2·√(Kp·I)) drops as inertia grows:
 
@@ -161,7 +161,7 @@ finding 1 removes this too.
 peak differs because the probe samples one step later. Both show a lightly damped
 response that settles quickly.
 
-### 3. LIMIT: the motor layout and COM have almost no effect on flight (lead 3)
+### 3. LIMIT: the motor layout and COM have almost no effect on flight (lead 3) — FIXED 2026-10-20 (phase 1: per-motor forces at the real motor positions; lever-rule test passes)
 
 - Thrust goes through `AddRelativeForce` (`:815`), which acts at the centre of mass, so
   **an off-centre COM creates no tipping moment.** Gravity and drag also act at the COM.
@@ -186,7 +186,7 @@ not for COM offset or motor placement. Making it hold needs thrust applied at ea
 motor's position (`AddForceAtPosition`) plus a mixer built from the real positions. That
 is a design change for the user to decide on.
 
-### 4. BUG: per-motor values are mirrored left to right (roll and yaw)
+### 4. BUG: per-motor values are mirrored left to right (roll and yaw) — FIXED 2026-10-20 (phase 1: sign tables removed; allocation built from motor positions)
 
 Measured above: +roll needs more lift on the **right**, and +yaw (clockwise from above)
 comes from the reaction torque of **counter-clockwise** propellers. The tables say the
@@ -214,7 +214,7 @@ Fix (needs approval): flip `motorRollSign` and `motorYawSign`. Because the torqu
 applied straight from the same tables, flight should stay identical, but confirm that in
 Unity before relying on it.
 
-### 5. BUG (in `CrashSystem.cs`): a broken arm kills the wrong motor
+### 5. BUG (in `CrashSystem.cs`): a broken arm kills the wrong motor — FIXED 2026-10-20 (phase 1: `MotorHealth` indexed by corner)
 
 `CrashSystem` sorts propellers by name (`CrashSystem.cs:202`) and builds arm groups in
 that order. `DetachArmGroup(index)` then sets `MotorHealth[index] = 0` (`:522`).
@@ -235,7 +235,7 @@ This is the same index trap `PropellerSpin` already handles with `motorIndices`
 work. It is out of `Flight.cs` but feeds it, so it is listed here. The motor-corner
 refactor (task C) is a natural place to fix it.
 
-### 6. LIMIT: thrust limits for heavy frames (lead 4)
+### 6. LIMIT: thrust limits for heavy frames (lead 4) — FIXED 2026-10-20 (phase 1: motors sized so hover is at `MPC_THR_HOVER`)
 
 Maximum thrust is 14.42 N per motor, 57.67 N in total (`kf · 1256.6²`).
 
