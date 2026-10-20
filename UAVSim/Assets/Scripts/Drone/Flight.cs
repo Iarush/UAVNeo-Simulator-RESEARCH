@@ -7,8 +7,10 @@ using UnityEngine;
 /// https://wilselby.com/research/arducopter/modeling/
 ///
 /// Implements:
-///   - 4-motor thrust model: thrust proportional to w^2 (motor angular velocity squared)
-///   - Motor mixing for X-configuration quadrotor
+///   - 4-motor model (spec .plans/real-flight-physics-spec.md, phase 1): motors auto-sized to
+///     hover at MPC_THR_HOVER, first-order spin-up/down lag (sub-stepped), each motor's thrust
+///     applied at its own position, yaw reaction KM * thrust per motor
+///   - Allocation from the frame's real motor positions about the centre of mass
 ///   - Translational dynamics: gravity + thrust (rotated to global frame) + aerodynamic drag
 ///   - Rotational dynamics: motor torques + propeller gyroscopic effects
 ///     (rigid-body gyroscopic term wxIw is handled by Unity's Rigidbody inertia tensor)
@@ -26,7 +28,7 @@ using UnityEngine;
 /// </summary>
 public class Flight : DroneModule
 {
-    #region Constants — Physical Parameters
+    #region Constants â€” Physical Parameters
 
     /// <summary>
     /// The default value of MaxSpeed (user-facing throttle scale, 0-1).
@@ -42,27 +44,30 @@ public class Flight : DroneModule
     /// </summary>
     private float armLength = 0.16f;
 
-    /// <summary>
-    /// armLength / sqrt(2) -- the effective roll/pitch moment arm for an X-configuration.
-    /// In an X-quad, motors are at +/-45 deg from the forward axis, so the perpendicular
-    /// distance to the roll or pitch axis is L*sin(45) = L/sqrt(2).
-    /// </summary>
-    private float armEffective => this.armLength * Mathf.Sqrt(2f) / 2f;
-
     // --------- Motor / Propeller Model ---------
+    // Spec: .plans/real-flight-physics-spec.md, section 4.2. Every frame's motors are auto-sized
+    // so it hovers at MPC_THR_HOVER: Tmax = m*g / (4 * MPC_THR_HOVER) per motor.
+
+    /// <summary>Maximum thrust of one motor (N), set per frame in Start().</summary>
+    private float motorThrustMax = 1f;
 
     /// <summary>
-    /// Thrust coefficient kf (N/(rad/s)^2).
-    /// Thrust per motor: F_i = kf * w_i^2
+    /// Thrust coefficient kf (N/(rad/s)^2), per frame: Tmax / motorSpeedMax^2. Only used to show
+    /// thrust as a motor speed (MotorSpeeds), so the propeller spin range is the same for every frame.
     /// </summary>
-    private const float kf = 9.13e-6f;
+    private float kf = 9.13e-6f;
 
     /// <summary>
-    /// Torque (drag) coefficient km (N*m/(rad/s)^2).
-    /// Reaction torque per motor: tau_i = km * w_i^2
-    /// Increased from physical value (1.83e-7) for snappier yaw response in simulation.
+    /// Yaw reaction moment per unit thrust (m), PX4 CA_ROTOR*_KM.
     /// </summary>
-    private const float km = 5.0e-7f;
+    private float yawMomentPerThrust = 0.05f;
+
+    /// <summary>Motor time constants (s) for spin-up and spin-down (flight-sim.json).</summary>
+    private float motorTauUp = 0.0125f;
+    private float motorTauDown = 0.025f;
+
+    /// <summary>Motor sub-steps per FixedUpdate (flight-sim.json).</summary>
+    private int subSteps = 5;
 
     /// <summary>
     /// Propeller moment of inertia about the spin axis (kg*m^2).
@@ -98,10 +103,10 @@ public class Flight : DroneModule
     // --------- Aerodynamic Drag ---------
 
     /// <summary>
-    /// Quadratic drag coefficient in the horizontal plane (N/(m/s)²).
-    /// Drag force is proportional to v², giving minimal drag at low speed (explosive
+    /// Quadratic drag coefficient in the horizontal plane (N/(m/s)Â²).
+    /// Drag force is proportional to vÂ², giving minimal drag at low speed (explosive
     /// acceleration) and strong drag near terminal velocity (same max speed).
-    /// Terminal velocity at full tilt (35°): v_max = sqrt(m*g*tan(35°) / dragXZ) ≈ 35 m/s.
+    /// Terminal velocity at full tilt (35Â°): v_max = sqrt(m*g*tan(35Â°) / dragXZ) â‰ˆ 35 m/s.
     /// </summary>
     private const float dragXZ = 0.011f;
 
@@ -112,54 +117,45 @@ public class Flight : DroneModule
     private const float dragY = 0.12f;
 
     /// <summary>
-    /// Rotational drag coefficient (N*m/(rad/s)).
+    /// Rotational drag coefficient (N*m/(rad/s)), flight-sim.json angularDragCoeff.
     /// </summary>
-    private const float angularDragCoeff = 0.005f;
+    private float angularDragCoeff = 0.005f;
 
-    // --------- Attitude Controller Gains ---------
+    // --------- PX4 attitude and rate loops (v1.17.0 stock gains, FlightConfig.Px4StockGains) ---------
+    // Vectors are in Unity body axes: x = pitch, y = yaw, z = roll.
 
-    /// <summary>Proportional gain for roll and pitch angle (N*m/rad).
-    /// Very high = racing snap, drone flicks to desired tilt near-instantly.</summary>
-    private const float Kp_rp = 10.0f;
+    private Vector3 attitudeP;      // MC_PITCH_P, MC_YAW_P, MC_ROLL_P
+    private float yawWeight;        // MC_YAW_WEIGHT
+    private Vector3 rateMax;        // MC_PITCHRATE_MAX, MC_YAWRATE_MAX, MC_ROLLRATE_MAX (rad/s)
+    private Vector3 rateP, rateI, rateD, rateFF, rateIntLim; // K already multiplied into P, I, D
+    private Vector3 rateIntegral;
+    private Vector3 previousRate;
+    private bool haveRate;
+    private Vector3 saturationPositive, saturationNegative; // 1 = that axis saturated last allocation
 
-    /// <summary>Derivative gain for roll and pitch rate (N*m/(rad/s)).
-    /// Very low = minimal resistance to attitude changes, zero mushiness.</summary>
-    private const float Kd_rp = 0.06f;
+    /// <summary>PX4-normalised mix (motor command per unit normalised torque) and its column scales.</summary>
+    private float[,] mixNormalised = new float[4, 3]; // columns: pitch(x), yaw(y), roll(z)
 
-    /// <summary>Proportional gain for yaw rate control (N*m/(rad/s)).
-    /// Time constant = Iyy/Kp_yaw = 0.006/0.55 = 0.011s — instant yaw, for the stock
-    /// inertia; scaled per frame, see yawGainScale.
-    /// </summary>
-    private const float Kp_yaw = 0.55f;
+    /// <summary>Body-frame inertia tensor and its inverse (for sub-step rate propagation).</summary>
+    private Matrix4x4 inertiaBody = Matrix4x4.identity;
+    private Matrix4x4 inertiaBodyInverse = Matrix4x4.identity;
 
-    // --------- Inertia-scaled gains ---------
-
-    // The attitude gains above were tuned for the stock drone's inertia. A custom frame's
-    // torques are scaled by (its body-axis inertia / these values) so it responds like the
-    // stock drone. Unscaled, frames with yaw inertia below ~0.0056 kg*m^2 (roll/pitch below
-    // ~0.0017) are unstable at the 0.02 s physics step and climb away (docs/flight-audit-2026-10-13.md).
-    private const float GainRefIxx = 0.003f;
-    private const float GainRefIyy = 0.006f;
-    private const float GainRefIzz = 0.003f;
-
-    // Exactly 1 for the stock drone.
-    private float pitchGainScale = 1f;
-    private float yawGainScale = 1f;
-    private float rollGainScale = 1f;
+    /// <summary>PX4 ControlAllocationSequentialDesaturation: extra yaw headroom.</summary>
+    private const float MinimumYawMargin = 0.15f;
 
     // --------- User Input Limits ---------
 
     /// <summary>
     /// Maximum tilt angle the user can command (degrees).
-    /// 35° at full scale → ~35 m/s terminal velocity.
+    /// 35Â° at full scale â†’ ~35 m/s terminal velocity.
     /// </summary>
     private const float maxTiltAngle = 35f;
 
     /// <summary>
-    /// Maximum yaw rate the user can command (degrees/second).
-    /// 200 deg/s = full 360 in 1.8 seconds — smooth but responsive.
+    /// Maximum yaw rate the user can command (degrees/second), from flight-sim.json
+    /// (pcmdMaxYawRateDegS: 1 rad/s, the real drone's limit).
     /// </summary>
-    private const float maxYawRate = 200f;
+    private float maxYawRate = 57.29578f;
 
     /// <summary>
     /// Maximum additional vertical thrust as a fraction of hover thrust.
@@ -168,9 +164,10 @@ public class Flight : DroneModule
     private const float maxVerticalThrustFraction = 1.8f;
 
     /// <summary>
-    /// Maximum angular velocity magnitude (rad/s) before safety clamping.
+    /// Maximum angular velocity magnitude (rad/s) before safety clamping: 1.5x the largest PX4
+    /// rate limit, so it never cuts into what the rate loop commands (set in ConfigureController).
     /// </summary>
-    private const float maxAngularVelocity = 3.0f;
+    private float maxAngularVelocity = 3.0f;
 
     /// <summary>
     /// Maximum tilt compensation factor for altitude hold under tilt.
@@ -207,7 +204,7 @@ public class Flight : DroneModule
 
     /// <summary>
     /// Heavy linear drag applied to the velocity component PERPENDICULAR to stick input.
-    /// When the pilot changes direction (e.g. forward → right), this kills the unwanted
+    /// When the pilot changes direction (e.g. forward â†’ right), this kills the unwanted
     /// cross-velocity almost instantly, giving razor-sharp directional control without
     /// affecting acceleration or top speed in the desired direction.
     /// </summary>
@@ -275,6 +272,24 @@ public class Flight : DroneModule
     /// Index 0 = front-right, 1 = front-left, 2 = back-left, 3 = back-right.
     /// </summary>
     public float[] MotorSpeeds { get; private set; } = new float[4];
+
+    /// <summary>
+    /// Current thrust of each motor (N) after the spin-up/down lag, same order as MotorSpeeds.
+    /// </summary>
+    public float[] MotorThrusts { get; private set; } = new float[4];
+
+    /// <summary>
+    /// Normalised motor commands (0-1, PX4 actuator_motors), after crash damage, same order.
+    /// </summary>
+    public float[] MotorCommands { get; private set; } = new float[4];
+
+    /// <summary>
+    /// Motor positions in the drone's local frame (from the propellers), same order.
+    /// </summary>
+    public Vector3[] MotorPositions { get; private set; } = new Vector3[4];
+
+    /// <summary>Maximum thrust of one motor (N): weight / (4 * MPC_THR_HOVER).</summary>
+    public float MotorThrustMax => this.motorThrustMax;
 
     /// <summary>
     /// Current motor RPMs for visualization / telemetry.
@@ -384,7 +399,7 @@ public class Flight : DroneModule
 
         TargetAltitude = landingY + 0.1f;
 
-        Debug.Log($"[Flight] Landing initiated — target surface at Y={landingY:F1}");
+        Debug.Log($"[Flight] Landing initiated â€” target surface at Y={landingY:F1}");
     }
 
     /// <summary>
@@ -401,7 +416,7 @@ public class Flight : DroneModule
         this.YawSpeed = 0;
         this.rBody.linearVelocity = Vector3.zero;
         this.rBody.angularVelocity = Vector3.zero;
-        for (int i = 0; i < 4; i++) this.MotorSpeeds[i] = 0f;
+        ZeroMotors();
         Debug.Log("[Flight] Landed and disarmed");
     }
 
@@ -432,29 +447,24 @@ public class Flight : DroneModule
     private float customMass = 0f; // 0 = keep the prefab's Rigidbody mass
 
     /// <summary>
-    /// Motor yaw torque sign for each motor.
-    /// CW motors produce positive yaw reaction torque, CCW produce negative.
-    /// X-configuration (looking from above):
-    ///   1 (FL, CW)    0 (FR, CCW)
-    ///   2 (BL, CCW)   3 (BR, CW)
-    /// So: 0(FR,CCW)=-1, 1(FL,CW)=+1, 2(BL,CCW)=-1, 3(BR,CW)=+1.
+    /// +1 for a propeller that turns clockwise seen from above (FL, BR), -1 for counter-clockwise
+    /// (FR, BL), in MotorSpeeds order. Unity is left-handed, so clockwise from above is a positive
+    /// rotation about +Y, and the reaction torque on the body is -spinCW * KM * T about +Y.
     /// </summary>
-    private static readonly float[] motorYawSign = { -1f, 1f, -1f, 1f };
+    private static readonly float[] spinCW = { -1f, 1f, -1f, 1f };
 
     /// <summary>
-    /// Motor roll torque contribution sign (depends on physical position, not spin).
+    /// Allocation: motor thrusts (N) = allocation * (total thrust, torque x, torque y, torque z),
+    /// torques about the centre of mass in body axes. Inverse of the effectiveness matrix built
+    /// from the frame's real motor positions in Start().
     /// </summary>
-    private static readonly float[] motorRollSign = { -1f, 1f, 1f, -1f };
+    private float[,] allocation = new float[4, 4];
 
     /// <summary>
-    /// Motor pitch torque contribution sign (depends on physical position, not spin).
+    /// Effectiveness: (total thrust, torque x, torque y, torque z) per newton of each motor.
     /// </summary>
-    private static readonly float[] motorPitchSign = { -1f, -1f, 1f, 1f };
+    private float[,] effectiveness = new float[4, 4];
 
-    /// <summary>
-    /// Temporary array for per-motor desired thrust during mixing.
-    /// </summary>
-    private float[] motorThrusts = new float[4];
 
     /// <summary>
     /// Reference to the CrashSystem for damage state queries.
@@ -507,18 +517,21 @@ public class Flight : DroneModule
         this.rBody.inertiaTensor = new Vector3(Ixx, Iyy, Izz);
         this.rBody.inertiaTensorRotation = this.customInertiaRotation;
 
-        Vector3 bodyInertia = BodyAxisInertia(new Vector3(Ixx, Iyy, Izz), this.customInertiaRotation);
-        this.pitchGainScale = GainScale(bodyInertia.x, GainRefIxx);
-        this.yawGainScale = GainScale(bodyInertia.y, GainRefIyy);
-        this.rollGainScale = GainScale(bodyInertia.z, GainRefIzz);
-        Debug.Log($"[Flight] Attitude gain scale (pitch, yaw, roll) = ({this.pitchGainScale:F3}, {this.yawGainScale:F3}, {this.rollGainScale:F3})");
+        // Body-frame tensor R * diag(principal) * R^T, used to propagate the rate between sub-steps.
+        Matrix4x4 R = Matrix4x4.Rotate(this.customInertiaRotation);
+        this.inertiaBody = R * Matrix4x4.Scale(new Vector3(Ixx, Iyy, Izz)) * R.transpose;
+        this.inertiaBodyInverse = R * Matrix4x4.Scale(new Vector3(1f / Ixx, 1f / Iyy, 1f / Izz)) * R.transpose;
+
+        ConfigureController();
 
         this.rBody.constraints = RigidbodyConstraints.None;
         this.rBody.maxAngularVelocity = maxAngularVelocity * 2f;
         this.rBody.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
         this.rBody.interpolation = RigidbodyInterpolation.Interpolate;
 
-        Debug.Log($"[Flight] Applied to rigidbody: mass={this.rBody.mass:F4} centerOfMass={this.rBody.centerOfMass:F4} inertiaTensor={this.rBody.inertiaTensor:F6} inertiaTensorRotation={this.rBody.inertiaTensorRotation} armLength={this.armLength:F4} armEffective={this.armEffective:F4}");
+        Debug.Log($"[Flight] Applied to rigidbody: mass={this.rBody.mass:F4} centerOfMass={this.rBody.centerOfMass:F4} inertiaTensor={this.rBody.inertiaTensor:F6} inertiaTensorRotation={this.rBody.inertiaTensorRotation} armLength={this.armLength:F4}");
+
+        ConfigureMotors();
 
         // Initialize target altitude and ground reference
         TargetAltitude = this.transform.position.y;
@@ -528,16 +541,16 @@ public class Flight : DroneModule
     private void FixedUpdate()
     {
         // ================================================================
-        // 0. ARM CHECK — if not armed, zero all motors and do nothing
+        // 0. ARM CHECK â€” if not armed, zero all motors and do nothing
         // ================================================================
         if (!IsArmed)
         {
-            for (int i = 0; i < 4; i++) this.MotorSpeeds[i] = 0f;
+            ZeroMotors();
             return;
         }
 
         // ================================================================
-        // 0a. LANDING CHECK — if near ground during auto-land, finish disarm
+        // 0a. LANDING CHECK â€” if near ground during auto-land, finish disarm
         // ================================================================
         if (IsLanding)
         {
@@ -553,11 +566,11 @@ public class Flight : DroneModule
         }
 
         // ================================================================
-        // 0b. CRASH CHECK — skip all motor logic if drone is destroyed
+        // 0b. CRASH CHECK â€” skip all motor logic if drone is destroyed
         // ================================================================
         if (crashSystem != null && crashSystem.IsDestroyed)
         {
-            for (int i = 0; i < 4; i++) this.MotorSpeeds[i] = 0f;
+            ZeroMotors();
             return;
         }
 
@@ -591,7 +604,7 @@ public class Flight : DroneModule
 
         // ================================================================
         // 2b. LAUNCH STABILIZATION: kinematic ascent to target altitude.
-        //     Bypasses the physics engine entirely — directly sets position,
+        //     Bypasses the physics engine entirely â€” directly sets position,
         //     rotation, and velocity each frame. This eliminates the
         //     limit-cycle oscillation caused by MoveRotation fighting motor
         //     torques on a non-kinematic Rigidbody.
@@ -605,7 +618,7 @@ public class Flight : DroneModule
             if (userInput)
             {
                 IsLaunching = false;
-                Debug.Log("[Flight] User took over during launch — exiting launch stabilization");
+                Debug.Log("[Flight] User took over during launch â€” exiting launch stabilization");
                 // Fall through to normal motor mixing below
             }
             else
@@ -617,20 +630,25 @@ public class Flight : DroneModule
                 float launchSpeed = Mathf.Clamp(altError * Kp_alt - vertVel * Kd_alt, -maxVerticalThrustFraction * 5f, maxVerticalThrustFraction * 5f);
                 Vector3 newPos = this.transform.position + Vector3.up * launchSpeed * Time.fixedDeltaTime;
 
-                // Lock attitude flat at current yaw — directly set transform, no physics
+                // Lock attitude flat at current yaw â€” directly set transform, no physics
                 float currentYaw = this.transform.eulerAngles.y;
                 this.rBody.Move(newPos, Quaternion.Euler(0f, currentYaw, 0f));
 
                 // Zero all physics velocities so no residual momentum fights us
                 this.rBody.linearVelocity = new Vector3(0f, launchSpeed, 0f);
                 this.rBody.angularVelocity = Vector3.zero;
+                ResetRateController();
 
-                // Display symmetric motor speeds for telemetry only
-                float launchGravity = Physics.gravity.magnitude;
-                float launchHoverThrust = this.rBody.mass * launchGravity;
-                float launchThrustPerMotor = launchHoverThrust / 4f;
-                float launchOmega = Mathf.Clamp(Mathf.Sqrt(launchThrustPerMotor / kf), motorSpeedMin, motorSpeedMax);
-                for (int i = 0; i < 4; i++) this.MotorSpeeds[i] = launchOmega;
+                // Telemetry only: hold each motor at its share of hover thrust (lever rule), so
+                // the lag model starts from hover when the launch hands over to the motors.
+                float launchHoverThrust = this.rBody.mass * Physics.gravity.magnitude;
+                for (int i = 0; i < 4; i++)
+                {
+                    float t = Mathf.Clamp(this.allocation[i, 0] * launchHoverThrust, 0f, this.motorThrustMax);
+                    this.MotorThrusts[i] = t;
+                    this.MotorCommands[i] = t / this.motorThrustMax;
+                    this.MotorSpeeds[i] = Mathf.Clamp(Mathf.Sqrt(t / kf), motorSpeedMin, motorSpeedMax);
+                }
 
                 // Check if launch is complete
                 if (Mathf.Abs(altError) < 0.5f && Mathf.Abs(vertVel) < 0.5f)
@@ -640,7 +658,7 @@ public class Flight : DroneModule
                     Debug.Log("[Flight] Launch complete - entering altitude hold");
                 }
 
-                return; // Skip motor mixing — kinematic launch handles everything
+                return; // Skip motor mixing â€” kinematic launch handles everything
             }
         }
 
@@ -689,7 +707,7 @@ public class Flight : DroneModule
         float desiredYawRate = this.YawSpeed * maxYawRate * Mathf.Deg2Rad;
 
         // Banking: yaw input induces a coordinated roll into the turn.
-        // Positive YawSpeed (right) → negative desiredRoll (bank right).
+        // Positive YawSpeed (right) â†’ negative desiredRoll (bank right).
         desiredRoll -= this.YawSpeed * bankAngle * scale;
 
         // ================================================================
@@ -740,116 +758,86 @@ public class Flight : DroneModule
         }
 
         // ================================================================
-        // 6. PD ATTITUDE CONTROLLER -> DESIRED TORQUES
+        // 6. PX4 ATTITUDE LOOP (once per FixedUpdate) -> RATE SETPOINT
+        //    PX4 v1.17.0 src/modules/mc_att_control/AttitudeControl/AttitudeControl.cpp:
+        //    reduced attitude (tilt first, yaw weighted by MC_YAW_WEIGHT), rate_sp = P * error
+        //    plus the yaw-rate feed-forward, limited by MC_*RATE_MAX.
         // ================================================================
 
-        float pitchError = (desiredPitch - currentPitch) * Mathf.Deg2Rad;
-        float rollError = (desiredRoll - currentRoll) * Mathf.Deg2Rad;
-        float yawRateError = desiredYawRate - q;
-
-        float tauPitch = (Kp_rp * pitchError - Kd_rp * p) * this.pitchGainScale;
-        float tauRoll = (Kp_rp * rollError - Kd_rp * r) * this.rollGainScale;
-        float tauYaw = Kp_yaw * yawRateError * this.yawGainScale;
+        Quaternion attitude = this.transform.rotation;
+        Quaternion attitudeSetpoint = Quaternion.Euler(desiredPitch, euler.y, desiredRoll);
+        Vector3 rateSetpoint = AttitudeControl(attitude, attitudeSetpoint, desiredYawRate);
 
         // ================================================================
-        // 7. MOTOR MIXING (X-CONFIGURATION) WITH SATURATION HANDLING
+        // 7. RATE LOOP + ALLOCATION + MOTOR LAG, SUB-STEPPED (subSteps per FixedUpdate)
+        //    Rate loop: PX4 src/lib/rate_control/rate_control.cpp. Allocation: PX4
+        //    ControlAllocationPseudoInverse (normalised mix) + ControlAllocationSequentialDesaturation
+        //    with MC_AIRMODE 0. Between sub-steps the rate is propagated from the torque applied:
+        //    w += I^-1 (tau - w x Iw) dt. PhysX gets the sub-step-averaged forces once per FixedUpdate.
         // ================================================================
 
-        float thrustPerMotor = desiredTotalThrust / 4f;
-        float rollMix = 1f / (4f * armEffective);
-        float pitchMix = 1f / (4f * armEffective);
-        float yawMix = 1f / (4f * (km / kf));
+        float Fmax = this.motorThrustMax;
+        float dtSub = Time.fixedDeltaTime / this.subSteps;
+        float globalScale = crashSystem != null ? crashSystem.MotorOutputScale : 1f;
+        float[] thrustSum = new float[4];
+        Vector3 rate = angVelBody;
 
-        float minFi = float.MaxValue;
-        float maxFi = float.MinValue;
-
-        for (int i = 0; i < 4; i++)
+        for (int s = 0; s < this.subSteps; s++)
         {
-            motorThrusts[i] = thrustPerMotor
-                             + motorRollSign[i] * tauRoll * rollMix
-                             + motorPitchSign[i] * tauPitch * pitchMix
-                             + motorYawSign[i] * tauYaw * yawMix;
+            Vector3 torqueNormalised = RateControl(rate, rateSetpoint, dtSub);
+            Allocate(torqueNormalised, desiredTotalThrust, this.MotorCommands);
 
-            if (motorThrusts[i] < minFi) minFi = motorThrusts[i];
-            if (motorThrusts[i] > maxFi) maxFi = motorThrusts[i];
-        }
+            // Crash damage scales the command of that corner's motor.
+            if (crashSystem != null)
+                for (int i = 0; i < 4; i++)
+                    this.MotorCommands[i] *= crashSystem.MotorHealth[i] * globalScale;
 
-        float Fmax = kf * motorSpeedMax * motorSpeedMax;
-
-        if (minFi < 0f)
-        {
-            float boost = -minFi;
-            for (int i = 0; i < 4; i++) motorThrusts[i] += boost;
-            maxFi += boost;
-        }
-
-        if (maxFi > Fmax)
-        {
-            float reduction = maxFi - Fmax;
-            for (int i = 0; i < 4; i++) motorThrusts[i] -= reduction;
-        }
-
-        for (int i = 0; i < 4; i++)
-        {
-            float Fi = Mathf.Max(motorThrusts[i], 0f);
-            float omega = Mathf.Sqrt(Fi / kf);
-            this.MotorSpeeds[i] = Mathf.Clamp(omega, motorSpeedMin, motorSpeedMax);
-        }
-
-        // Apply crash damage
-        if (crashSystem != null)
-        {
-            float globalScale = crashSystem.MotorOutputScale;
+            Vector3 torque = -this.angularDragCoeff * rate;
             for (int i = 0; i < 4; i++)
             {
-                this.MotorSpeeds[i] *= crashSystem.MotorHealth[i] * globalScale;
+                float t = MotorLagStep(this.MotorThrusts[i], this.MotorCommands[i] * Fmax, dtSub, this.motorTauUp, this.motorTauDown);
+                this.MotorThrusts[i] = t;
+                thrustSum[i] += t;
+                Vector3 d = this.MotorPositions[i] - this.rBody.centerOfMass;
+                torque += new Vector3(-d.z * t, -spinCW[i] * this.yawMomentPerThrust * t, d.x * t);
             }
+
+            Vector3 Iw = this.inertiaBody.MultiplyVector(rate);
+            rate += this.inertiaBodyInverse.MultiplyVector(torque - Vector3.Cross(rate, Iw)) * dtSub;
         }
 
         // ================================================================
-        // 8. COMPUTE ACTUAL FORCES & TORQUES FROM MOTOR SPEEDS
+        // 8. APPLY FORCES AND TORQUES (sub-step averages)
         // ================================================================
 
-        float actualThrust = 0f;
-        float actualTauPitch = 0f;
-        float actualTauRoll = 0f;
-        float actualTauYaw = 0f;
+        float tauYawReaction = 0f;
         float Omega_r = 0f;
-
         for (int i = 0; i < 4; i++)
         {
-            float wi = this.MotorSpeeds[i];
-            float Fi = kf * wi * wi;
+            float avg = thrustSum[i] / this.subSteps;
+            float wi = Mathf.Clamp(Mathf.Sqrt(this.MotorThrusts[i] / kf), motorSpeedMin, motorSpeedMax);
+            this.MotorSpeeds[i] = wi;
 
-            actualThrust += Fi;
-            actualTauPitch += motorPitchSign[i] * Fi * armEffective;
-            actualTauRoll += motorRollSign[i] * Fi * armEffective;
-            actualTauYaw += motorYawSign[i] * km * wi * wi;
-
-            Omega_r += motorYawSign[i] * wi;
+            // Each motor pushes along body up at its own position.
+            this.rBody.AddForceAtPosition(this.transform.up * avg, this.transform.TransformPoint(this.MotorPositions[i]));
+            tauYawReaction += -spinCW[i] * this.yawMomentPerThrust * avg;
+            Omega_r += spinCW[i] * wi;
         }
 
-        // ================================================================
-        // 9. APPLY FORCES AND TORQUES
-        // ================================================================
-
-        // Thrust along drone's local UP
-        this.rBody.AddRelativeForce(Vector3.up * actualThrust);
-
-        // Motor torques in body frame
-        this.rBody.AddRelativeTorque(new Vector3(actualTauPitch, actualTauYaw, actualTauRoll));
+        // Motor drag-torque reaction about body up
+        this.rBody.AddRelativeTorque(new Vector3(0f, tauYawReaction, 0f));
 
         // Propeller gyroscopic effect
         Vector3 propGyro = JTP * Omega_r * new Vector3(-r, 0f, p);
         this.rBody.AddRelativeTorque(propGyro);
 
-        // ── Aerodynamic drag (velocity-decomposed) ──
+        // â”€â”€ Aerodynamic drag (velocity-decomposed) â”€â”€
         // Horizontal velocity is split into a component ALIGNED with the stick
         // direction and a CROSS (perpendicular) component.
-        //  • Aligned: quadratic drag → near-zero at low speed (explosive accel),
+        //  â€¢ Aligned: quadratic drag â†’ near-zero at low speed (explosive accel),
         //    strong at terminal velocity (caps top speed).
-        //  • Cross: heavy linear drag → kills unwanted sideways momentum almost
-        //    instantly → razor-sharp direction changes.
+        //  â€¢ Cross: heavy linear drag â†’ kills unwanted sideways momentum almost
+        //    instantly â†’ razor-sharp direction changes.
         // Vertical drag remains simple linear.
 
         Vector3 vel = this.rBody.linearVelocity;
@@ -880,7 +868,7 @@ public class Flight : DroneModule
             Vector3 velXZ = new Vector3(vel.x, 0f, vel.z);
             Vector3 stickWorld = this.transform.forward * this.ForwardSpeed
                                + this.transform.right * this.StrafeSpeed;
-            stickWorld.y = 0f; // Project to horizontal plane — transform.forward tilts with the drone
+            stickWorld.y = 0f; // Project to horizontal plane â€” transform.forward tilts with the drone
 
             if (stickWorld.sqrMagnitude > 0.001f && velXZ.sqrMagnitude > 0.01f)
             {
@@ -895,9 +883,9 @@ public class Flight : DroneModule
                 if (alignedMag < 0f) alignedCoeff += reverseBrakeDrag;
 
                 // Cross component: scale braking by how perpendicular the velocity is
-                // to the stick. When steering (W+D), velocity is mostly aligned →
-                // minimal cross-brake → speed preserved. When doing a hard 90° swap
-                // (release W, press D only), velocity is fully perpendicular → full brake.
+                // to the stick. When steering (W+D), velocity is mostly aligned â†’
+                // minimal cross-brake â†’ speed preserved. When doing a hard 90Â° swap
+                // (release W, press D only), velocity is fully perpendicular â†’ full brake.
                 float alignedFraction = Mathf.Clamp01(alignedMag / speedXZ);
                 float crossCoeff = crossBrakeDrag * (1f - alignedFraction);
 
@@ -921,7 +909,7 @@ public class Flight : DroneModule
         // ================================================================
         // 10. MOMENTUM CONSERVATION DURING YAW
         //     Rotate the horizontal velocity vector to follow the yaw rotation.
-        //     This preserves speed when turning — the drone redirects its
+        //     This preserves speed when turning â€” the drone redirects its
         //     momentum instead of fighting drag to rebuild speed in a new direction.
         // ================================================================
         if (Mathf.Abs(this.YawSpeed) > 0.05f)
@@ -939,6 +927,162 @@ public class Flight : DroneModule
     }
 
     /// <summary>
+    /// Sizes the motors for this frame, finds their positions and builds the allocation.
+    /// Runs in Start(), after the Rigidbody has its mass and centre of mass.
+    /// </summary>
+    private void ConfigureMotors()
+    {
+        float hover = FlightConfig.Px4("MPC_THR_HOVER");
+        this.yawMomentPerThrust = FlightConfig.Px4("CA_ROTOR0_KM");
+        this.motorTauUp = FlightConfig.Sim("motorTimeConstantUp");
+        this.motorTauDown = FlightConfig.Sim("motorTimeConstantDown");
+        this.subSteps = Mathf.Max(1, Mathf.RoundToInt(FlightConfig.Sim("subSteps")));
+
+        this.motorThrustMax = this.rBody.mass * Physics.gravity.magnitude / (4f * hover);
+        this.kf = this.motorThrustMax / (motorSpeedMax * motorSpeedMax);
+
+        // The stock prefab's propeller visuals sit at about 0.72 m, far outside its physical
+        // 0.16 m arm and 0.003 kg*m^2 inertia, so only a custom frame (propellers moved onto its
+        // motors by CustomFrameLoader) takes positions from the propellers.
+        string source;
+        if (this.customMass > 0f)
+            source = FindMotorPositions(this.MotorPositions) ? "propellers" : "fallback X layout from armLength";
+        else
+        {
+            FallbackMotorPositions(this.MotorPositions, this.armLength);
+            source = "stock X layout from armLength";
+        }
+        if (!BuildAllocation(this.MotorPositions, this.rBody.centerOfMass, this.yawMomentPerThrust, this.allocation))
+        {
+            Debug.LogError("[Flight] Motor layout gives no control authority on some axis; using the fallback X layout.");
+            FallbackMotorPositions(this.MotorPositions, this.armLength);
+            source = "fallback X layout from armLength";
+            BuildAllocation(this.MotorPositions, this.rBody.centerOfMass, this.yawMomentPerThrust, this.allocation);
+        }
+        BuildNormalisedMix();
+
+        Debug.Log($"[Flight] Motors: Tmax={this.motorThrustMax:F3} N each (hover at {hover:F2}), kf={this.kf:E3}, KM={this.yawMomentPerThrust:F3}, " +
+                  $"tau up/down={this.motorTauUp:F4}/{this.motorTauDown:F4} s, {this.subSteps} sub-steps; positions from {source}: " +
+                  $"FR {this.MotorPositions[0]:F4} FL {this.MotorPositions[1]:F4} BL {this.MotorPositions[2]:F4} BR {this.MotorPositions[3]:F4}");
+    }
+
+    /// <summary>
+    /// Motor positions in the drone's local frame, taken from the four Propeller_N objects
+    /// (which CustomFrameLoader has already moved onto a custom frame's motors) and keyed by
+    /// corner. Returns false and fills the fallback X layout if there is not one per corner.
+    /// </summary>
+    private bool FindMotorPositions(Vector3[] positions)
+    {
+        bool[] seen = new bool[4];
+        int count = 0;
+        foreach (Transform t in this.GetComponentsInChildren<Transform>(true))
+        {
+            if (!t.name.StartsWith("Propeller_")) continue;
+            Vector3 local = this.transform.InverseTransformPoint(t.position);
+            int index = MotorQuadrants.MotorIndex(MotorQuadrants.ClassifyUnity(local));
+            if (seen[index]) { count = -1; break; }
+            seen[index] = true;
+            positions[index] = local;
+            count++;
+        }
+        if (count == 4) return true;
+
+        Debug.LogWarning("[Flight] Did not find one propeller per corner; motor positions use an X layout from armLength.");
+        FallbackMotorPositions(positions, this.armLength);
+        return false;
+    }
+
+    private static void FallbackMotorPositions(Vector3[] positions, float arm)
+    {
+        float a = arm / Mathf.Sqrt(2f);
+        positions[0] = new Vector3(a, 0f, a);    // FR
+        positions[1] = new Vector3(-a, 0f, a);   // FL
+        positions[2] = new Vector3(-a, 0f, -a);  // BL
+        positions[3] = new Vector3(a, 0f, -a);   // BR
+    }
+
+    /// <summary>
+    /// Builds the allocation (inverse effectiveness): thrust of motor i =
+    /// A[i,0]*total + A[i,1]*torqueX + A[i,2]*torqueY + A[i,3]*torqueZ (body axes, about the COM).
+    /// A motor at d (from the COM) with thrust T along body up gives torque d x (0, T, 0) =
+    /// (-d.z*T, 0, d.x*T), plus the yaw reaction -spinCW*KM*T about up.
+    /// </summary>
+    private bool BuildAllocation(Vector3[] positions, Vector3 com, float km, float[,] result)
+    {
+        double[,] b = new double[4, 4];
+        for (int i = 0; i < 4; i++)
+        {
+            Vector3 d = positions[i] - com;
+            b[0, i] = 1.0;
+            b[1, i] = -d.z;
+            b[2, i] = -spinCW[i] * km;
+            b[3, i] = d.x;
+            for (int a = 0; a < 4; a++) this.effectiveness[a, i] = (float)b[a, i];
+        }
+        if (!Invert4(b, out double[,] inv)) return false;
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+            {
+                if (!double.IsFinite(inv[i, j])) return false;
+                result[i, j] = (float)inv[i, j];
+            }
+        return true;
+    }
+
+    /// <summary>Gauss-Jordan inverse with partial pivoting; false if (near) singular.</summary>
+    private static bool Invert4(double[,] m, out double[,] inv)
+    {
+        const int n = 4;
+        double[,] a = (double[,])m.Clone();
+        inv = new double[n, n];
+        for (int i = 0; i < n; i++) inv[i, i] = 1.0;
+
+        for (int c = 0; c < n; c++)
+        {
+            int pivot = c;
+            for (int r = c + 1; r < n; r++)
+                if (System.Math.Abs(a[r, c]) > System.Math.Abs(a[pivot, c])) pivot = r;
+            if (System.Math.Abs(a[pivot, c]) < 1e-9) return false;
+            for (int k = 0; k < n; k++)
+            {
+                (a[c, k], a[pivot, k]) = (a[pivot, k], a[c, k]);
+                (inv[c, k], inv[pivot, k]) = (inv[pivot, k], inv[c, k]);
+            }
+            double scale = 1.0 / a[c, c];
+            for (int k = 0; k < n; k++) { a[c, k] *= scale; inv[c, k] *= scale; }
+            for (int r = 0; r < n; r++)
+            {
+                if (r == c) continue;
+                double f = a[r, c];
+                if (f == 0.0) continue;
+                for (int k = 0; k < n; k++) { a[r, k] -= f * a[c, k]; inv[r, k] -= f * inv[c, k]; }
+            }
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// One step of the first-order motor model: thrust moves toward target with time constant
+    /// tauUp when rising and tauDown when falling (exact for a constant target over dt).
+    /// </summary>
+    public static float MotorLagStep(float thrust, float target, float dt, float tauUp, float tauDown)
+    {
+        float tau = target > thrust ? tauUp : tauDown;
+        if (tau <= 0f) return target;
+        return thrust + (target - thrust) * (1f - Mathf.Exp(-dt / tau));
+    }
+
+    private void ZeroMotors()
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            this.MotorSpeeds[i] = 0f;
+            this.MotorThrusts[i] = 0f;
+            this.MotorCommands[i] = 0f;
+        }
+    }
+
+    /// <summary>
     /// Normalizes a Unity Euler angle (0-360) to the range [-180, 180].
     /// </summary>
     private static float NormalizeAngle(float angle)
@@ -947,23 +1091,217 @@ public class Flight : DroneModule
         return angle;
     }
 
-    /// <summary>
-    /// Moment of inertia about each body axis: the diagonal of R * diag(principal) * R^T.
-    /// </summary>
-    private static Vector3 BodyAxisInertia(Vector3 principal, Quaternion rotation)
+    #region PX4 attitude and rate control
+
+    /// <summary>Loads the PX4 stock gains and the real drone's rate limits.</summary>
+    private void ConfigureController()
     {
-        Matrix4x4 R = Matrix4x4.Rotate(rotation);
-        Vector3 result = Vector3.zero;
-        for (int a = 0; a < 3; a++)
-            for (int k = 0; k < 3; k++)
-                result[a] += R[a, k] * R[a, k] * principal[k];
-        return result;
+        this.attitudeP = new Vector3(FlightConfig.Px4StockGains.PitchP, FlightConfig.Px4StockGains.YawP, FlightConfig.Px4StockGains.RollP);
+        this.yawWeight = FlightConfig.Px4("MC_YAW_WEIGHT");
+        this.maxYawRate = FlightConfig.Sim("pcmdMaxYawRateDegS");
+        this.rateMax = new Vector3(FlightConfig.Px4("MC_PITCHRATE_MAX"), FlightConfig.Px4("MC_YAWRATE_MAX"), FlightConfig.Px4("MC_ROLLRATE_MAX")) * Mathf.Deg2Rad;
+
+        // mc_rate_control: P, I and D are multiplied by K; FF is not.
+        Vector3 k = new Vector3(FlightConfig.Px4StockGains.PitchRateK, FlightConfig.Px4StockGains.YawRateK, FlightConfig.Px4StockGains.RollRateK);
+        this.rateP = Vector3.Scale(k, new Vector3(FlightConfig.Px4StockGains.PitchRateP, FlightConfig.Px4StockGains.YawRateP, FlightConfig.Px4StockGains.RollRateP));
+        this.rateI = Vector3.Scale(k, new Vector3(FlightConfig.Px4StockGains.PitchRateI, FlightConfig.Px4StockGains.YawRateI, FlightConfig.Px4StockGains.RollRateI));
+        this.rateD = Vector3.Scale(k, new Vector3(FlightConfig.Px4StockGains.PitchRateD, FlightConfig.Px4StockGains.YawRateD, FlightConfig.Px4StockGains.RollRateD));
+        this.rateFF = new Vector3(FlightConfig.Px4StockGains.PitchRateFF, FlightConfig.Px4StockGains.YawRateFF, FlightConfig.Px4StockGains.RollRateFF);
+        this.rateIntLim = new Vector3(FlightConfig.Px4StockGains.PitchRateIntLim, FlightConfig.Px4StockGains.YawRateIntLim, FlightConfig.Px4StockGains.RollRateIntLim);
+
+        this.angularDragCoeff = FlightConfig.Sim("angularDragCoeff");
+        this.maxAngularVelocity = 1.5f * Mathf.Max(this.rateMax.x, Mathf.Max(this.rateMax.y, this.rateMax.z));
+        ResetRateController();
+
+        Debug.Log($"[Flight] PX4 controller: attitude P (pitch, yaw, roll) {this.attitudeP}, yaw weight {this.yawWeight}, " +
+                  $"rate max {this.rateMax * Mathf.Rad2Deg} deg/s, rate P {this.rateP:F3} I {this.rateI:F3} D {this.rateD:F4}");
     }
 
-    /// <summary>inertia / reference, or 1 if that is not a usable positive number.</summary>
-    private static float GainScale(float inertia, float reference)
+    private void ResetRateController()
     {
-        float scale = inertia / reference;
-        return float.IsFinite(scale) && scale > 0f ? scale : 1f;
+        this.rateIntegral = Vector3.zero;
+        this.haveRate = false;
+        this.saturationPositive = Vector3.zero;
+        this.saturationNegative = Vector3.zero;
     }
+
+    /// <summary>
+    /// PX4 AttitudeControl::update (src/modules/mc_att_control/AttitudeControl/AttitudeControl.cpp,
+    /// v1.17.0). Body-axis rate setpoint (rad/s) from the attitude and its setpoint; the yaw-rate
+    /// setpoint (about world up) is fed forward. Unity quaternions, body up = +Y.
+    /// </summary>
+    private Vector3 AttitudeControl(Quaternion q, Quaternion qd, float yawRateSetpoint)
+    {
+        // Reduced attitude: the shortest rotation that tilts the thrust axis onto the setpoint's.
+        Vector3 ez = q * Vector3.up, ezd = qd * Vector3.up;
+        Quaternion qdRed = Quaternion.FromToRotation(ez, ezd) * q;
+
+        // Mix in only yaw_weight of the remaining yaw rotation.
+        Quaternion qMix = Canonical(Quaternion.Inverse(qdRed) * qd);
+        float w = Mathf.Clamp(qMix.w, -1f, 1f), y = Mathf.Clamp(qMix.y, -1f, 1f);
+        qd = qdRed * new Quaternion(0f, Mathf.Sin(this.yawWeight * Mathf.Asin(y)), 0f, Mathf.Cos(this.yawWeight * Mathf.Acos(w)));
+
+        Quaternion qe = Canonical(Quaternion.Inverse(q) * qd);
+        Vector3 eq = 2f * new Vector3(qe.x, qe.y, qe.z);
+        Vector3 rateSp = Vector3.Scale(eq, this.attitudeP);
+
+        rateSp += (Quaternion.Inverse(q) * Vector3.up) * yawRateSetpoint;
+
+        for (int a = 0; a < 3; a++)
+            rateSp[a] = Mathf.Clamp(rateSp[a], -this.rateMax[a], this.rateMax[a]);
+        return rateSp;
+    }
+
+    private static Quaternion Canonical(Quaternion q) => q.w < 0f ? new Quaternion(-q.x, -q.y, -q.z, -q.w) : q;
+
+    /// <summary>
+    /// PX4 RateControl::update (src/lib/rate_control/rate_control.cpp, v1.17.0): normalised torque
+    /// = P*e + I + FF*sp - D*angular_accel, integrator with saturation anti-windup, the 400 deg/s
+    /// I-factor and MC_*_INT_LIM.
+    /// </summary>
+    private Vector3 RateControl(Vector3 rate, Vector3 rateSp, float dt)
+    {
+        Vector3 error = rateSp - rate;
+        Vector3 accel = this.haveRate ? (rate - this.previousRate) / dt : Vector3.zero;
+        this.previousRate = rate;
+        this.haveRate = true;
+
+        Vector3 torque = Vector3.Scale(this.rateP, error) + this.rateIntegral - Vector3.Scale(this.rateD, accel) + Vector3.Scale(this.rateFF, rateSp);
+
+        for (int a = 0; a < 3; a++)
+        {
+            float e = error[a];
+            if (this.saturationPositive[a] > 0f) e = Mathf.Min(e, 0f);
+            if (this.saturationNegative[a] > 0f) e = Mathf.Max(e, 0f);
+            float iFactor = e / (400f * Mathf.Deg2Rad);
+            iFactor = Mathf.Max(0f, 1f - iFactor * iFactor);
+            float ri = this.rateIntegral[a] + iFactor * this.rateI[a] * e * dt;
+            if (float.IsFinite(ri))
+                this.rateIntegral[a] = Mathf.Clamp(ri, -this.rateIntLim[a], this.rateIntLim[a]);
+        }
+        return torque;
+    }
+
+    /// <summary>
+    /// PX4 ControlAllocationPseudoInverse::updateControlAllocationMatrixScale/normalize (v1.17.0):
+    /// the mix (motor command u per unit torque) from this frame's allocation, with the roll and
+    /// pitch columns scaled together by sqrt(|col|^2 / (n/2)) and yaw by its largest entry.
+    /// </summary>
+    private void BuildNormalisedMix()
+    {
+        // allocation columns: 0 thrust, 1 torque x (pitch), 2 torque y (yaw), 3 torque z (roll); in N.
+        float[,] mu = new float[4, 3];
+        for (int i = 0; i < 4; i++)
+            for (int a = 0; a < 3; a++)
+                mu[i, a] = this.allocation[i, a + 1] / this.motorThrustMax;
+
+        float RollPitchScale(int a)
+        {
+            float sq = 0f; int n = 0;
+            for (int i = 0; i < 4; i++) { sq += mu[i, a] * mu[i, a]; if (Mathf.Abs(mu[i, a]) > 1e-3f) n++; }
+            return n > 0 ? Mathf.Sqrt(sq / (n / 2f)) : 1f;
+        }
+        float rp = Mathf.Max(RollPitchScale(0), RollPitchScale(2));
+        float yaw = float.MinValue;
+        for (int i = 0; i < 4; i++) yaw = Mathf.Max(yaw, mu[i, 1]);
+
+        float[] scale = { rp, yaw, rp };
+        for (int i = 0; i < 4; i++)
+            for (int a = 0; a < 3; a++)
+            {
+                float v = scale[a] > float.Epsilon ? mu[i, a] / scale[a] : mu[i, a];
+                this.mixNormalised[i, a] = Mathf.Abs(v) < 1e-3f ? 0f : v;
+            }
+
+        // Physical torque per unit normalised torque, for the stability warning (phase 5) and logs.
+        Debug.Log($"[Flight] Allocation scale: roll/pitch {rp:F4}, yaw {yaw:F4} (u per N*m); " +
+                  $"full normalised torque = {1f / rp:F4} N*m roll/pitch, {1f / yaw:F4} N*m yaw");
+    }
+
+    private readonly float[] allocIdeal = new float[4];
+    private readonly float[] allocThrustZ = new float[4];
+    private readonly float[] allocAxis = new float[4];
+
+    /// <summary>
+    /// PX4 ControlAllocationSequentialDesaturation with MC_AIRMODE 0 (mixAirmodeDisabled + mixYaw):
+    /// roll/pitch/thrust first, thrust may only rise to unsaturate, then roll and pitch are
+    /// desaturated, yaw is added last with 15% extra headroom and gives way first.
+    /// Collective thrust uses this frame's lever-rule column in newtons. Sets the saturation flags
+    /// the rate integrators use.
+    /// </summary>
+    private void Allocate(Vector3 torqueNormalised, float thrustN, float[] u)
+    {
+        float meanThrust = 0f;
+        for (int i = 0; i < 4; i++) meanThrust += Mathf.Abs(this.allocation[i, 0]);
+        meanThrust /= 4f;
+
+        for (int i = 0; i < 4; i++)
+        {
+            float thrustPart = this.allocation[i, 0] * thrustN / this.motorThrustMax;
+            u[i] = thrustPart + this.mixNormalised[i, 0] * torqueNormalised.x + this.mixNormalised[i, 2] * torqueNormalised.z;
+            allocIdeal[i] = u[i] + this.mixNormalised[i, 1] * torqueNormalised.y;
+            allocThrustZ[i] = this.allocation[i, 0] / meanThrust;
+        }
+
+        Desaturate(u, allocThrustZ, 1f, true);
+        for (int i = 0; i < 4; i++) allocAxis[i] = this.mixNormalised[i, 2];
+        Desaturate(u, allocAxis, 1f, false); // roll
+        for (int i = 0; i < 4; i++) allocAxis[i] = this.mixNormalised[i, 0];
+        Desaturate(u, allocAxis, 1f, false); // pitch
+
+        // mixYaw
+        for (int i = 0; i < 4; i++)
+        {
+            allocAxis[i] = this.mixNormalised[i, 1];
+            u[i] += allocAxis[i] * torqueNormalised.y;
+        }
+        Desaturate(u, allocAxis, 1f + MinimumYawMargin, false);
+        Desaturate(u, allocThrustZ, 1f, true);
+
+        for (int i = 0; i < 4; i++) u[i] = Mathf.Clamp01(u[i]);
+
+        // Saturation flags (PX4 ControlAllocator: unallocated torque per axis).
+        for (int a = 0; a < 3; a++)
+        {
+            float unallocated = 0f;
+            for (int i = 0; i < 4; i++)
+                unallocated += this.effectiveness[a + 1, i] * (allocIdeal[i] - u[i]) * this.motorThrustMax;
+            this.saturationPositive[a] = unallocated > 1e-5f ? 1f : 0f;
+            this.saturationNegative[a] = unallocated < -1e-5f ? 1f : 0f;
+        }
+    }
+
+    /// <summary>PX4 ControlAllocationSequentialDesaturation::desaturateActuators (actuator range 0..max).</summary>
+    private static void Desaturate(float[] u, float[] direction, float max, bool increaseOnly)
+    {
+        float gain = DesaturationGain(direction, u, max);
+        if (increaseOnly && gain < 0f) return;
+        for (int i = 0; i < 4; i++) u[i] += gain * direction[i];
+        gain = 0.5f * DesaturationGain(direction, u, max);
+        for (int i = 0; i < 4; i++) u[i] += gain * direction[i];
+    }
+
+    private static float DesaturationGain(float[] direction, float[] u, float max)
+    {
+        float kMin = 0f, kMax = 0f;
+        for (int i = 0; i < 4; i++)
+        {
+            if (Mathf.Abs(direction[i]) < 0.2f) continue;
+            if (u[i] < 0f)
+            {
+                float k = -u[i] / direction[i];
+                if (k < kMin) kMin = k;
+                if (k > kMax) kMax = k;
+            }
+            if (u[i] > max)
+            {
+                float k = (max - u[i]) / direction[i];
+                if (k < kMin) kMin = k;
+                if (k > kMax) kMax = k;
+            }
+        }
+        return kMin + kMax;
+    }
+
+    #endregion
 }

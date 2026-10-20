@@ -65,6 +65,21 @@ public static class MotorQuadrants
     }
 
     /// <summary>
+    /// Index of a corner's motor in Flight.MotorSpeeds / CrashSystem.MotorHealth: FR 0, FL 1,
+    /// BL 2, BR 3. This differs from the Quadrant enum order, so never cast a Quadrant instead.
+    /// </summary>
+    public static int MotorIndex(Quadrant quadrant)
+    {
+        switch (quadrant)
+        {
+            case Quadrant.FrontRight: return 0;
+            case Quadrant.FrontLeft: return 1;
+            case Quadrant.BackLeft: return 2;
+            default: return 3;
+        }
+    }
+
+    /// <summary>
     /// True when a position sits exactly on one of the two dividing planes.
     ///
     /// Tested against the raw CAD values rather than the converted ones: this reports back what

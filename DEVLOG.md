@@ -48,6 +48,84 @@ implement custom `.stl` drone import:
 
 ---
 
+## 2026-10-20 — Real flight physics, phases 0 and 1 (branch `feature/real-flight-physics`)
+
+Spec: `.plans/real-flight-physics-spec.md`. All tests run through Unity MCP in the
+Editor (Unity 6000.4.5f1).
+
+**Phase 0: foundations (no flight change)**
+- `tools/extract-px4-params.py` (stdlib only; run with the bundled
+  `UAVSim/Assets/MassService~/python/python.exe -I`): reads QGC `.tlog` files,
+  CRC-checks MAVLink v1/v2 `PARAM_VALUE` and `AUTOPILOT_VERSION`, refuses logs from
+  a different vehicle uid, writes QGC-format params.
+- `UAVSim/Assets/StreamingAssets/Flight/uav-neo.params`: 1133 params from the
+  2026-07-29 17-08-00 log, PX4 v1.17.0 official. Merging all 5 logs gives identical values.
+- `UAVSim/Assets/StreamingAssets/Flight/flight-sim.json`: sim-only values, each
+  with its source (motor time constants, launch height, `send_pcmd` scaling, drag,
+  sub-steps).
+- `Drone/FlightConfig.cs`: loads both files with built-in fallbacks (one
+  `Debug.LogError` per bad file). `Px4StockGains` holds the PX4 v1.17.0 stock rate
+  gains, confirmed from the v1.17.0 source (`mc_rate_control_params.c`,
+  `mc_att_control_params.c`); the real drone's tuned rate gains are not used.
+- Baseline hover traces on the old physics (20 s each; `Baseline_HoverTrace`):
+  default 2.0 kg 7.23 mm max altitude error, cube 1.7 kg 7.06 mm, 7-inch 0.741 kg
+  7.05 mm, yaw-light 1.2 kg 7.22 mm, small 0.28 kg 7.14 mm; drift and tilt 0 on all.
+- `FlightConfigTests`: 4/4 pass.
+
+**Phase 1: motors, plus the PX4 loops (pulled forward from phase 2, owner decision)**
+- `Flight.cs` (owner-approved):
+  - Motors sized per frame so hover is at `MPC_THR_HOVER` (Tmax = m·g / (4·0.5)).
+    First-order lag, τ_up 12.5 ms and τ_down 25 ms. One `AddForceAtPosition` per
+    motor at its real position. Yaw reaction from each motor's spin direction
+    (`CA_ROTOR0_KM` 0.05).
+  - The allocation is the inverse of the effectiveness matrix built from the motor
+    positions about the real COM. The sign tables, the old PD gains and the
+    inertia gain scaling (2026-10-14) are removed.
+  - PX4 v1.17.0 attitude loop (reduced attitude, `MC_YAW_WEIGHT`), rate loop
+    (P/I/D/FF/K with PX4's integrator rules), normalised mix and `MC_AIRMODE` 0
+    sequential desaturation. The rate loop, allocation and motor lag are
+    sub-stepped 5× per 0.02 s physics step (250 Hz).
+  - Why the PX4 loops were pulled forward: with motor lag τ, the old PD loop is
+    stable only if Kd > τ·Kp, and the old 10 / 0.06 gains fail that test. The first
+    phase 1 run (old PD plus lag) rocked 6–8° and the cube and 7-inch lost metres
+    of altitude.
+  - Motor positions come from the propellers only for custom frames. The stock
+    prefab's propeller visuals sit at about ±0.72 m, but its physics model is a
+    0.16 m arm with 0.003 kg·m² inertia; using the visuals flipped it. The stock
+    drone therefore uses an X layout from `armLength`.
+- `CrashSystem.cs`: a detached arm now zeroes `MotorHealth` of that arm's corner
+  (audit finding 5). `MotorQuadrants.MotorIndex(Quadrant)` maps FR 0, FL 1, BL 2, BR 3.
+- Owner decisions 2026-10-20:
+  - `MC_ROLL_P` / `MC_PITCH_P` are the real drone's 6.5, not stock 4.0.
+  - `send_pcmd` and keyboard yaw 1.0 = 1 rad/s (57.3 °/s; was 200 °/s;
+    `pcmdMaxYawRateDegS`). This answers task 0.6.
+  - Lab regression is run once after all phases, not per phase. It has not been
+    run yet. **Lab-visible changes in this phase:** max yaw rate 1 rad/s; tilt
+    response with motor lag and the 6.5 attitude gain.
+- `FlightMotorTests` (new), final run with 6.5 and 1 rad/s, 13/13 pass with `FlightConfigTests`:
+  - Motor lag: 63% at 12.51 ms up and 25.00 ms down.
+  - Hover (default, cube, 7-inch): mean u 0.5000, max altitude error 0.11–0.13 cm,
+    drift 0, tilt 0.000°.
+  - Off-centre COM (battery at CAD x 0.1): right pair 59.80% measured vs 59.80%
+    lever rule, tilt 0.000°. This is the imbalance test the 2026-10-13 hover test
+    could not do.
+  - Pitch forward and roll right: 17.4°, 1.12 m moved in 1 s, correct motors lead.
+  - Yaw right: 56.6 °/s after 0.8 s (limit 57.3), FR+BL lead.
+  - Crash: FL thrust 4.906 → 2.204 N after one step (lag) → 0 N.
+  - Baseline hover on the new physics (run with gain 4.0 and 200 °/s, before the
+    owner decisions): all 5 frames ≤ 7.48 mm, drift and tilt 0.
+- Test changes from the spec:
+  - Yaw: the commands are averaged over the first 5 steps. The stock drone reaches
+    its rate setpoint within a step or two, so a single sample lands on the
+    oscillation.
+  - Crash: the "dips toward FL" check is dropped. Under the PX4 loops the drone
+    stays nearly level and the other three motors saturate, so the response is
+    reported, not asserted.
+- Not done: the profiler measurement of the sub-step cost (agreed: drop to 2
+  sub-steps only if it shows up). A hand flight.
+- Temporary: `UAVSim/Assets/Editor/TmpTestResultWriter.cs` writes test results
+  to `UAVSim/Temp/tmp-test-results.txt` for the MCP runs. Delete it before committing.
+
 ## 2026-10-14
 
 - **Climbing bug fixed: attitude gains scale with each frame's inertia
