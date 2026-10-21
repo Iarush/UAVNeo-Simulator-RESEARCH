@@ -80,7 +80,8 @@ Spec: `.plans/real-flight-physics-spec.md`; results in DEVLOG 2026-10-20.
 - **Motors:** sized so hover is at `MPC_THR_HOVER`; first-order lag (12.5 / 25 ms); one force per motor at its position; yaw reaction from spin direction. Motor index order is FR 0, FL 1, BL 2, BR 3 (`MotorQuadrants.MotorIndex`).
 - **Motor positions:** custom frames use the propeller transforms (placed by `CustomFrameLoader`). The stock drone uses an X layout from `armLength` (0.16 m), because its propeller visuals sit at about ±0.72 m and do not match its physics.
 - **Phase 2 (done 2026-10-20):** PX4 velocity/position and vertical loops; released sticks brake by tilting (setpoint ramp at `MPC_ACC_HOR`) then lock position; banking, brake drags, velocity snap and yaw velocity rotation removed. Tests in `Tests/PlayMode/FlightControlTests.cs`.
-- **Still old (phases 3–5):** keyboard uses the `send_pcmd` path (no POSCTL yet), kinematic launch (`KinematicLaunchStep`), simple drag. Lab regression is deferred to the end.
+- **Phase 3 (done 2026-10-20):** keyboard/controller fly PX4 POSCTL (`Flight.ControlMode`, set in `LevelManager.Update`); sticks are speed up to `KeyboardMaxSpeed` 30 m/s and climb up to `KeyboardMaxClimbRate` 10 m/s at 1.0 × `MaxSpeed` (owner values); `send_pcmd` keeps the tilt meaning.
+- **Still old (phases 4–5):** kinematic launch (`KinematicLaunchStep`), simple drag. Lab regression is deferred to the end.
 - **Tests:** `UAVSim/Assets/Tests/PlayMode/FlightConfigTests.cs`, `FlightMotorTests.cs` (the `Baseline` category is the slow 20 s, 5-frame hover trace), `FlightControlTests.cs` (phase 2), `FlightPosCtlTests.cs` (phase 3). Run them with the Unity CLI, not Unity MCP (owner decision 2026-10-20), with the Editor closed: `"C:\Program Files\Unity\Hub\Editor\6000.4.5f1\Editor\Unity.exe" -batchmode -projectPath UAVSim -runTests -testPlatform PlayMode -testFilter <regex> -testResults <xml> -logFile <log>`.
 
 ## Wire protocol (LOCKED — do not change either side)

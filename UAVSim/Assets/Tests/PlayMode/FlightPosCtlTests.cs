@@ -13,10 +13,22 @@ namespace UAVSim.Tests.PlayMode
     {
         private static float KeyboardMaxSpeed() => (float)GameType("Flight").GetField("KeyboardMaxSpeed").GetRawConstantValue();
 
+        /// <summary>
+        /// Keyboard speeds reach 30 m/s, so these tests cover hundreds of metres and would hit the
+        /// level. Every collider except the drone's is turned off so they measure flight, not crashes.
+        /// </summary>
+        private void ClearSky()
+        {
+            foreach (Collider c in Object.FindObjectsByType<Collider>(FindObjectsSortMode.None))
+                if (!c.transform.IsChildOf(drone.transform))
+                    c.enabled = false;
+        }
+
         [UnityTest]
         public IEnumerator PosCtl_FullStickSpeed([Values(0.5f, 1.0f)] float maxSpeed)
         {
             yield return Fly(DefaultDrone());
+            ClearSky();
             SetMode("PosCtl");
             Set(flight, "MaxSpeed", maxSpeed);
             yield return FastSteps(50);
@@ -60,6 +72,7 @@ namespace UAVSim.Tests.PlayMode
         public IEnumerator PosCtl_ReleaseBrakesAndHolds()
         {
             yield return Fly(DefaultDrone());
+            ClearSky();
             SetMode("PosCtl");
             Set(flight, "MaxSpeed", 1f);
             for (int f = 0; f < 200; f++)
@@ -72,7 +85,8 @@ namespace UAVSim.Tests.PlayMode
             Vector3 start = drone.transform.position, at5 = Vector3.zero;
             float previous = v0, peakDecel = 0f, minPitch = 0f, stopDistance = float.NaN;
             Set(flight, "ForwardSpeed", 0f);
-            for (int f = 1; f <= 400; f++)
+            // Braking from keyboard speed takes several seconds; the hold is checked over the last 3 s.
+            for (int f = 1; f <= 650; f++)
             {
                 yield return Steps(1);
                 float along = Vector3.Dot(rb.linearVelocity, dir);
@@ -80,13 +94,13 @@ namespace UAVSim.Tests.PlayMode
                 minPitch = Mathf.Min(minPitch, Normalize(drone.transform.eulerAngles.x));
                 if (float.IsNaN(stopDistance) && along <= 0f)
                     stopDistance = Vector3.Dot(drone.transform.position - start, dir);
-                if (f == 250) at5 = drone.transform.position;
+                if (f == 500) at5 = drone.transform.position;
                 previous = along;
             }
             float accMax = Cfg("Px4", "MPC_ACC_HOR_MAX");
             float held = Flat3(drone.transform.position - at5).magnitude;
             Report($"PosCtl release at {v0:F2} m/s: peak deceleration {peakDecel:F2} m/s^2, stopping distance {stopDistance:F3} m " +
-                   $"(minimum {v0 * v0 / (2f * accMax):F3}), max nose-up {-minPitch:F2} deg, moved {held * 100:F1} cm from 5 s to 8 s");
+                   $"(minimum {v0 * v0 / (2f * accMax):F3}), max nose-up {-minPitch:F2} deg, moved {held * 100:F1} cm from 10 s to 13 s");
             Assert.LessOrEqual(peakDecel, accMax * 1.1f, "braked harder than MPC_ACC_HOR_MAX");
             Assert.GreaterOrEqual(stopDistance, v0 * v0 / (2f * accMax), "stopped too quickly");
             Assert.Less(minPitch, -1f, "drone did not tilt backwards to brake");
