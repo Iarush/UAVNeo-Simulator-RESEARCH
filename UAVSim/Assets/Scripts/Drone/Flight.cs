@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
@@ -103,19 +104,17 @@ public class Flight : DroneModule
 
     // --------- Aerodynamic Drag ---------
 
-    /// <summary>
-    /// Quadratic drag coefficient in the horizontal plane (N/(m/s)Â²).
-    /// Drag force is proportional to vÂ², giving minimal drag at low speed (explosive
-    /// acceleration) and strong drag near terminal velocity (same max speed).
-    /// Terminal velocity at full tilt (35Â°): v_max = sqrt(m*g*tan(35Â°) / dragXZ) â‰ˆ 35 m/s.
-    /// </summary>
-    private const float dragXZ = 0.011f;
+    // Spec 4.2 item 6: per body axis F = -1/2 * rho * Cd * A_axis * |v_axis| * v_axis, with
+    // A_axis = projected bounds area x dragFillFactor (flight-sim.json), set per frame in Start().
 
-    /// <summary>
-    /// Linear drag coefficient along the vertical axis (N/(m/s)).
-    /// Lower = faster ascent/descent response.
-    /// </summary>
-    private const float dragY = 0.12f;
+    /// <summary>Air density at sea level (kg/m^3).</summary>
+    private const float AirDensity = 1.225f;
+
+    /// <summary>Drag coefficient Cd (flight-sim.json dragCd).</summary>
+    private float dragCd = 1.0f;
+
+    /// <summary>Drag area per body axis (m^2): x = side, y = top, z = front. Set in ConfigureDrag().</summary>
+    private Vector3 dragArea = new Vector3(0.01f, 0.01f, 0.01f);
 
     /// <summary>
     /// Rotational drag coefficient (N*m/(rad/s)), flight-sim.json angularDragCoeff.
@@ -525,7 +524,7 @@ public class Flight : DroneModule
         // === Configure Rigidbody for accurate physics ===
         this.rBody.useGravity = true;
         this.rBody.linearDamping = 0f;
-        this.rBody.angularDamping = 0.02f;
+        this.rBody.angularDamping = 0f;
 
         // Mass first: the inertia tensor below is absolute and must not be rescaled by it.
         if (this.customMass > 0f)
@@ -556,6 +555,8 @@ public class Flight : DroneModule
         Debug.Log($"[Flight] Applied to rigidbody: mass={this.rBody.mass:F4} centerOfMass={this.rBody.centerOfMass:F4} inertiaTensor={this.rBody.inertiaTensor:F6} inertiaTensorRotation={this.rBody.inertiaTensorRotation} armLength={this.armLength:F4}");
 
         ConfigureMotors();
+        ConfigureDrag();
+        CheckControlAuthority();
 
         // Initialize target altitude and ground reference
         TargetAltitude = this.transform.position.y;
@@ -898,10 +899,11 @@ public class Flight : DroneModule
         Vector3 propGyro = JTP * Omega_r * new Vector3(-r, 0f, p);
         this.rBody.AddRelativeTorque(propGyro);
 
-        // Aerodynamic drag: quadratic horizontal, linear vertical (frame-scaled drag is phase 5).
+        // Aerodynamic drag, quadratic per body axis from this frame's projected area.
         // No brake forces: the drone stops only by tilting.
-        float hSpeed = Mathf.Sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
-        this.rBody.AddForce(new Vector3(-dragXZ * hSpeed * velocity.x, -dragY * velocity.y, -dragXZ * hSpeed * velocity.z));
+        this.rBody.AddRelativeForce(DragForce(this.transform.InverseTransformDirection(velocity), this.dragArea, this.dragCd));
+
+        DetectOscillation(rateSetpoint - angVelBody);
 
         // Aerodynamic angular drag
         this.rBody.AddRelativeTorque(-angularDragCoeff * angVelBody);
@@ -1077,6 +1079,9 @@ public class Flight : DroneModule
     /// (-d.z*T, 0, d.x*T), plus the yaw reaction -spinCW*KM*T about up.
     /// </summary>
     private bool BuildAllocation(Vector3[] positions, Vector3 com, float km, float[,] result)
+        => ComputeAllocation(positions, com, km, result, this.effectiveness);
+
+    private static bool ComputeAllocation(Vector3[] positions, Vector3 com, float km, float[,] result, float[,] effectiveness)
     {
         double[,] b = new double[4, 4];
         for (int i = 0; i < 4; i++)
@@ -1086,7 +1091,8 @@ public class Flight : DroneModule
             b[1, i] = -d.z;
             b[2, i] = -spinCW[i] * km;
             b[3, i] = d.x;
-            for (int a = 0; a < 4; a++) this.effectiveness[a, i] = (float)b[a, i];
+            if (effectiveness != null)
+                for (int a = 0; a < 4; a++) effectiveness[a, i] = (float)b[a, i];
         }
         if (!Invert4(b, out double[,] inv)) return false;
         for (int i = 0; i < 4; i++)
@@ -1159,6 +1165,219 @@ public class Flight : DroneModule
         if (angle > 180f) angle -= 360f;
         return angle;
     }
+
+    #region Drag and stability warning (spec 4.2 item 6, 4.7)
+
+    /// <summary>Drag area per body axis (m^2): x = side, y = top, z = front.</summary>
+    public Vector3 DragArea => this.dragArea;
+
+    /// <summary>Control authority per body axis (pitch, yaw, roll), see <see cref="TryControlAuthority"/>.</summary>
+    public Vector3 ControlAuthority { get; private set; }
+
+    /// <summary>The stability warning shown for this frame, or null.</summary>
+    public string StabilityWarning { get; private set; }
+
+    /// <summary>
+    /// Quadratic drag in body axes: -1/2 * rho * Cd * A_axis * |v_axis| * v_axis per axis.
+    /// </summary>
+    public static Vector3 DragForce(Vector3 velocityBody, Vector3 area, float cd)
+    {
+        float k = 0.5f * AirDensity * cd;
+        return new Vector3(
+            -k * area.x * Mathf.Abs(velocityBody.x) * velocityBody.x,
+            -k * area.y * Mathf.Abs(velocityBody.y) * velocityBody.y,
+            -k * area.z * Mathf.Abs(velocityBody.z) * velocityBody.z);
+    }
+
+    /// <summary>
+    /// Drag areas from this frame's bounds in body axes, times dragFillFactor. A custom frame uses
+    /// its imported mesh. The stock body's renderers are drawn at about 6x its physical size
+    /// (propellers at about 0.72 m against a 0.16 m arm, see ConfigureMotors), so its bounds are
+    /// scaled by physical arm / visual propeller arm, like its motor positions.
+    /// </summary>
+    private void ConfigureDrag()
+    {
+        this.dragCd = FlightConfig.Sim("dragCd");
+        float fill = FlightConfig.Sim("dragFillFactor");
+
+        bool any = false;
+        Bounds b = new Bounds();
+        void Add(Bounds local, Transform t)
+        {
+            Vector3 c = local.center, e = local.extents;
+            for (int i = 0; i < 8; i++)
+            {
+                Vector3 corner = c + Vector3.Scale(e, new Vector3((i & 1) == 0 ? -1 : 1, (i & 2) == 0 ? -1 : 1, (i & 4) == 0 ? -1 : 1));
+                Vector3 p = this.transform.InverseTransformPoint(t.TransformPoint(corner));
+                if (!any) { b = new Bounds(p, Vector3.zero); any = true; }
+                else b.Encapsulate(p);
+            }
+        }
+
+        string source;
+        CustomFrameLoader loader = this.GetComponent<CustomFrameLoader>();
+        if (this.customMass > 0f && loader != null && loader.CustomFrameBounds.HasValue)
+        {
+            foreach (MeshFilter mf in this.GetComponentsInChildren<MeshFilter>(false))
+                if (mf.sharedMesh != null && mf.sharedMesh.bounds == loader.CustomFrameBounds)
+                    Add(mf.sharedMesh.bounds, mf.transform);
+            source = "custom frame mesh";
+        }
+        else
+        {
+            foreach (Renderer r in this.GetComponentsInChildren<Renderer>(false))
+                if (r is MeshRenderer || r is SkinnedMeshRenderer)
+                    Add(r.localBounds, r.transform);
+            float visualArm = 0f; int n = 0;
+            foreach (Transform t in this.GetComponentsInChildren<Transform>(true))
+            {
+                if (!t.name.StartsWith("Propeller_")) continue;
+                Vector3 local = this.transform.InverseTransformPoint(t.position);
+                visualArm += new Vector2(local.x, local.z).magnitude;
+                n++;
+            }
+            float scale = n > 0 && visualArm > 0f ? this.armLength / (visualArm / n) : 1f;
+            b = new Bounds(b.center * scale, b.size * scale);
+            source = $"stock renderers x {scale:F3}";
+        }
+
+        if (!any || b.size.x <= 0f || b.size.y <= 0f || b.size.z <= 0f)
+        {
+            float span = 2f * this.armLength / Mathf.Sqrt(2f);
+            b = new Bounds(Vector3.zero, new Vector3(span, 0.25f * span, span));
+            source = "box from armLength (no bounds found)";
+        }
+
+        Vector3 size = b.size;
+        this.dragArea = fill * new Vector3(size.y * size.z, size.x * size.z, size.x * size.y);
+        Debug.Log($"[Flight] Drag: Cd {this.dragCd:F2}, bounds {size:F4} m from {source}, fill {fill:F2} -> area side/top/front {this.dragArea:F5} m^2");
+    }
+
+    /// <summary>
+    /// PX4 normalisation scales of a mix mu (u per N*m, columns pitch, yaw, roll): roll and pitch
+    /// share sqrt(|col|^2 / (n/2)), yaw uses its largest entry.
+    /// </summary>
+    private static void MixScales(float[,] mu, out float rollPitch, out float yaw)
+    {
+        float RollPitchScale(int a)
+        {
+            float sq = 0f; int n = 0;
+            for (int i = 0; i < 4; i++) { sq += mu[i, a] * mu[i, a]; if (Mathf.Abs(mu[i, a]) > 1e-3f) n++; }
+            return n > 0 ? Mathf.Sqrt(sq / (n / 2f)) : 1f;
+        }
+        rollPitch = Mathf.Max(RollPitchScale(0), RollPitchScale(2));
+        yaw = float.MinValue;
+        for (int i = 0; i < 4; i++) yaw = Mathf.Max(yaw, mu[i, 1]);
+    }
+
+    /// <summary>
+    /// Control authority of a frame per body axis (pitch, yaw, roll), in rad/s^2 per unit of PX4
+    /// normalised torque: the physical torque one unit of rate-loop output makes (allocation from
+    /// the real motor positions, normalised as PX4 does) divided by the inertia about that axis.
+    /// The PX4 stock rate gains act on this, so it decides whether they suit the frame.
+    /// Positions and COM in Unity body axes (m); motors sized to hover at MPC_THR_HOVER.
+    /// </summary>
+    public static bool TryControlAuthority(Vector3[] motorPositions, Vector3 com, float massKg, Vector3 inertiaDiagonal, out Vector3 authority)
+    {
+        authority = Vector3.zero;
+        float thrustMax = massKg * Physics.gravity.magnitude / (4f * FlightConfig.Px4("MPC_THR_HOVER"));
+        var alloc = new float[4, 4];
+        if (!(thrustMax > 0f) || !ComputeAllocation(motorPositions, com, FlightConfig.Px4("CA_ROTOR0_KM"), alloc, null))
+            return false;
+        var mu = new float[4, 3];
+        for (int i = 0; i < 4; i++)
+            for (int a = 0; a < 3; a++)
+                mu[i, a] = alloc[i, a + 1] / thrustMax;
+        MixScales(mu, out float rp, out float yaw);
+        if (!(rp > 0f) || !(yaw > 0f) || !(inertiaDiagonal.x > 0f) || !(inertiaDiagonal.y > 0f) || !(inertiaDiagonal.z > 0f))
+            return false;
+        authority = new Vector3(1f / rp / inertiaDiagonal.x, 1f / yaw / inertiaDiagonal.y, 1f / rp / inertiaDiagonal.z);
+        return float.IsFinite(authority.x) && float.IsFinite(authority.y) && float.IsFinite(authority.z);
+    }
+
+    /// <summary>
+    /// Checks an authority against the stability band in flight-sim.json (roll/pitch and yaw
+    /// ranges, measured by the phase 5 sweep). Null when inside, else which axes are out.
+    /// </summary>
+    public static string DescribeAuthorityProblem(Vector3 authority)
+    {
+        float rpMin = FlightConfig.Sim("stabilityRollPitchMin"), rpMax = FlightConfig.Sim("stabilityRollPitchMax");
+        float yMin = FlightConfig.Sim("stabilityYawMin"), yMax = FlightConfig.Sim("stabilityYawMax");
+        var problems = new List<string>();
+        void Check(string axis, float value, float min, float max)
+        {
+            if (value < min) problems.Add($"{axis} too sluggish ({value:F0} < {min:F0})");
+            else if (value > max) problems.Add($"{axis} too twitchy ({value:F0} > {max:F0})");
+        }
+        Check("roll", authority.z, rpMin, rpMax);
+        Check("pitch", authority.x, rpMin, rpMax);
+        Check("yaw", authority.y, yMin, yMax);
+        return problems.Count == 0 ? null : string.Join(", ", problems);
+    }
+
+    /// <summary>Spec 4.7: warn in flight when this frame's authority is outside the band.</summary>
+    private void CheckControlAuthority()
+    {
+        this.StabilityWarning = null;
+        Vector3 inertiaDiagonal = new Vector3(this.inertiaBody.m00, this.inertiaBody.m11, this.inertiaBody.m22);
+        if (!TryControlAuthority(this.MotorPositions, this.rBody.centerOfMass, this.rBody.mass, inertiaDiagonal, out Vector3 authority))
+            return;
+        this.ControlAuthority = authority;
+        Debug.Log($"[Flight] Control authority (rad/s^2 per unit torque): roll {authority.z:F0}, pitch {authority.x:F0}, yaw {authority.y:F0}");
+        string problem = DescribeAuthorityProblem(authority);
+        if (problem != null)
+            WarnUnstable($"This frame may be unstable with PX4 stock gains: {problem}.");
+    }
+
+    /// <summary>Rate error above which a sign change counts as an oscillation swing (rad/s).</summary>
+    private const float OscillationRateError = 0.5f;
+    /// <summary>Longest gap between swings that still counts as one oscillation (s).</summary>
+    private const float OscillationMaxHalfPeriod = 0.25f;
+    /// <summary>How long the swings must continue before the warning (s).</summary>
+    private const float OscillationWarnTime = 2f;
+
+    private readonly float[] oscillationLastSwing = { -1f, -1f, -1f };
+    private readonly float[] oscillationRun = new float[3];
+    private readonly float[] oscillationSign = new float[3];
+    private bool oscillationWarned;
+
+    /// <summary>
+    /// Spec 4.7: sustained attitude oscillation = the rate error keeps changing sign, beyond
+    /// OscillationRateError, at least every OscillationMaxHalfPeriod for OscillationWarnTime.
+    /// </summary>
+    private void DetectOscillation(Vector3 rateError)
+    {
+        if (this.oscillationWarned) return;
+        float now = Time.fixedTime;
+        for (int a = 0; a < 3; a++)
+        {
+            float e = rateError[a];
+            if (Mathf.Abs(e) < OscillationRateError) continue;
+            float sign = Mathf.Sign(e);
+            if (sign == this.oscillationSign[a]) continue;
+            this.oscillationSign[a] = sign;
+            float gap = now - this.oscillationLastSwing[a];
+            this.oscillationRun[a] = this.oscillationLastSwing[a] >= 0f && gap <= OscillationMaxHalfPeriod ? this.oscillationRun[a] + gap : 0f;
+            this.oscillationLastSwing[a] = now;
+            if (this.oscillationRun[a] >= OscillationWarnTime)
+            {
+                this.oscillationWarned = true;
+                string axis = a == 0 ? "pitch" : a == 1 ? "yaw" : "roll";
+                WarnUnstable($"Sustained {axis} oscillation: this frame is unstable with PX4 stock gains.");
+                return;
+            }
+        }
+    }
+
+    private void WarnUnstable(string message)
+    {
+        this.StabilityWarning = message;
+        Debug.LogWarning($"[Flight] Stability warning: {message}");
+        try { LevelManager.ShowMessage(message, Color.yellow, 10f); }
+        catch (System.Exception) { /* no HUD in this scene */ }
+    }
+
+    #endregion
 
     #region PX4 attitude and rate control
 
@@ -1292,15 +1511,7 @@ public class Flight : DroneModule
             for (int a = 0; a < 3; a++)
                 mu[i, a] = this.allocation[i, a + 1] / this.motorThrustMax;
 
-        float RollPitchScale(int a)
-        {
-            float sq = 0f; int n = 0;
-            for (int i = 0; i < 4; i++) { sq += mu[i, a] * mu[i, a]; if (Mathf.Abs(mu[i, a]) > 1e-3f) n++; }
-            return n > 0 ? Mathf.Sqrt(sq / (n / 2f)) : 1f;
-        }
-        float rp = Mathf.Max(RollPitchScale(0), RollPitchScale(2));
-        float yaw = float.MinValue;
-        for (int i = 0; i < 4; i++) yaw = Mathf.Max(yaw, mu[i, 1]);
+        MixScales(mu, out float rp, out float yaw);
 
         float[] scale = { rp, yaw, rp };
         for (int i = 0; i < 4; i++)
@@ -1310,7 +1521,7 @@ public class Flight : DroneModule
                 this.mixNormalised[i, a] = Mathf.Abs(v) < 1e-3f ? 0f : v;
             }
 
-        // Physical torque per unit normalised torque, for the stability warning (phase 5) and logs.
+        // Physical torque per unit normalised torque (the stability warning uses the same scales).
         Debug.Log($"[Flight] Allocation scale: roll/pitch {rp:F4}, yaw {yaw:F4} (u per N*m); " +
                   $"full normalised torque = {1f / rp:F4} N*m roll/pitch, {1f / yaw:F4} N*m yaw");
     }

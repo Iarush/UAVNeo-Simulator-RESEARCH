@@ -48,6 +48,47 @@ implement custom `.stl` drone import:
 
 ---
 
+## 2026-10-20 — Real flight physics, phase 5 (frame-scaled drag, stability warnings)
+
+Spec: `.plans/real-flight-physics-spec.md` §4.2 item 6 and §4.7. Awaiting owner approval; not committed.
+
+- **Drag** (`Flight.ConfigureDrag`, `Flight.DragForce`): quadratic per body axis,
+  `F = -½·ρ·Cd·A_axis·|v|·v`, ρ 1.225, `dragCd` 1.0, `A = projected bounds area × dragFillFactor` (0.5).
+  Custom frames use the imported mesh's bounds. The stock body's renderers are about 6× its physical size
+  (the same mismatch as its propellers), so its bounds are scaled by physical arm / visual propeller arm
+  (×0.158): bounds (0.267, 0.118, 0.408) m, areas side/top/front (0.0240, 0.0545, 0.0157) m². The old
+  `dragXZ` / `dragY` constants are gone; `linearDamping` and `angularDamping` are both 0 (angular damping was 0.02).
+- **Control authority** (`Flight.TryControlAuthority`): rad/s² per unit of PX4 normalised torque, i.e. the
+  physical torque from the PX4-normalised allocation of the real motor positions ÷ inertia. Shared by flight and
+  the import panel. Stock drone: roll/pitch 1046, yaw 327. Cube quad: 574 / 156.
+- **Band sweep** (`StabilityBand_Sweep`, category `Sweep`): stock drone with roll/pitch or yaw inertia scaled
+  ×0.01–×200, then a pitch+yaw kick. Roll/pitch stable from 52 to 2093; unstable at 21 (slow divergence)
+  and from 5232 up (high-rate oscillation / flip). Yaw stable from 2 to 16350; oscillates at 32700.
+  Band = geometric midpoints: roll/pitch [33, 3300], yaw [2, 23000] (`flight-sim.json`, with sources).
+  Yaw below 2 was not tested, so its lower bound is the lowest tested value, not a measured edge.
+- **In-flight warning** (`Flight.CheckControlAuthority`, `DetectOscillation`): outside the band →
+  `LevelManager.ShowMessage` (yellow, 10 s) plus a `[Flight] Stability warning:` Console warning. Oscillation:
+  rate error beyond 0.5 rad/s changing sign at least every 0.25 s for 2 s (fired in the sweep for the
+  unstable high-authority cases).
+- **Build Drone estimate** (`FrameStabilityEstimate.cs`, called from `ImportPageUI.OnBuildDroneClicked`):
+  open item 1 decided as the C# mesh inertia integral (signed tetrahedra, ~40 lines) plus node point masses,
+  on body axes (no principal rotation). Panel status gains "May be unstable: …". **Owner to confirm this choice**
+  (the alternative was the bounds-only estimate, which ignores the mesh mass — 1 kg of the cube quad's 1.7 kg).
+- **Tests** (`Tests/PlayMode/FlightDragStabilityTests.cs`):
+  - `Drag_ScalesWithArea`: stock drone 40 m up (clear of scenery 14 m ahead of the spawn), pitch 0.5, 50× and
+    100× the stock area: 2.521 vs 1.782 m/s, ratio 0.707 (expected 0.707 ±10%). PASS.
+  - `StabilityWarning_ShownForOutOfBandFrame`: stock drone no warning; stock with 100× inertia (authority 10)
+    warns on HUD and Console once. PASS.
+  - `StabilityWarning_CustomFrames`: cube quad no warning; short-arm frame (motors ±0.03 m, two 1 kg nodes at
+    CAD x ±0.4) roll authority 4 → warns. PASS.
+  - `BuildDrone_WarnsForOutOfBandEstimate`: panel status for the short-arm frame reads
+    "May be unstable: roll too sluggish (4 < 33)."; cube quad none. PASS.
+- **Full PlayMode run** (`-testCategory "!Sweep"`): 47 total, 38 passed, 6 skipped (existing skips), 3 failed:
+  `Drag_ScalesWithArea` (since fixed, see above) and **`Land_DescendsAndDisarms_DefaultDrone` / `_Cube`:
+  max descent 0.633 / 0.632 m/s against the 0.63 limit** (phase 4 measured 0.628). Cause: the removed linear
+  vertical drag (0.12 N per m/s) had been damping the descent overshoot. Not loosened; owner decision.
+- Lab regression: deferred to the end (owner decision 2026-10-20).
+
 ## 2026-10-20 — Real flight physics, phase 4 (physics takeoff and landing, ground contact)
 
 Spec: `.plans/real-flight-physics-spec.md` §4.5, §4.2 item 7. Not committed; waiting for owner approval.

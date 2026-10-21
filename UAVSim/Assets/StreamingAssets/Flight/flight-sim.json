@@ -9,6 +9,10 @@
     { "key": "dragCd", "value": 1.0, "source": "estimate: generic bluff-body drag coefficient" },
     { "key": "dragFillFactor", "value": 0.5, "source": "estimate: fraction of the projected bounds area that is solid" },
     { "key": "angularDragCoeff", "value": 0.005, "source": "estimate: Flight.cs value before this work (N*m per rad/s)" },
-    { "key": "subSteps", "value": 5, "source": "sim: inner-loop sub-steps per 0.02 s physics step (250 Hz)" }
+    { "key": "subSteps", "value": 5, "source": "sim: inner-loop sub-steps per 0.02 s physics step (250 Hz)" },
+    { "key": "stabilityRollPitchMin", "value": 33, "source": "phase 5 sweep 2026-10-20: stock drone roll/pitch inertia scaled; stable 52..2093, unstable at 21 and 5232; bounds are the geometric midpoints (rad/s^2 per unit normalised torque)" },
+    { "key": "stabilityRollPitchMax", "value": 3300, "source": "phase 5 sweep 2026-10-20, see stabilityRollPitchMin" },
+    { "key": "stabilityYawMin", "value": 2, "source": "phase 5 sweep 2026-10-20: yaw stable from 2 (lowest tested) to 16350, oscillates at 32700" },
+    { "key": "stabilityYawMax", "value": 23000, "source": "phase 5 sweep 2026-10-20, see stabilityYawMin" }
   ]
 }
