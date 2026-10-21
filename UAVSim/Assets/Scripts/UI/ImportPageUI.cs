@@ -160,7 +160,10 @@ public class ImportPageUI : MonoBehaviour
         CustomFrameLoader.SelectedSTLPath = selectedPath;
         CustomFrameLoader.SelectedDensity = density;
 
-        SetStatus($"Stored {Path.GetFileName(selectedPath)} at {density.ToString(CultureInfo.InvariantCulture)} kg/m^3.");
+        // Spec 4.7: an estimate here (the mass service is only asked in the flight scene).
+        string stability = FrameStabilityEstimate.Warn(selectedPath, density, CustomFrameLoader.SelectedNodes);
+        SetStatus($"Stored {Path.GetFileName(selectedPath)} at {density.ToString(CultureInfo.InvariantCulture)} kg/m^3." +
+                  (stability == null ? "" : " " + stability));
     }
 
     // ================================================================

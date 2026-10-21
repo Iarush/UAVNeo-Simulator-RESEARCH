@@ -88,10 +88,15 @@ public static class FlightConfig
         { "motorTimeConstantDown", 0.025f },
         { "launchHeight", 1.0f },
         { "pcmdMaxTiltDeg", 35f },
-        { "pcmdMaxYawRateDegS", 57.29578f },        { "dragCd", 1.0f },
+        { "pcmdMaxYawRateDegS", 57.29578f },
+        { "dragCd", 1.0f },
         { "dragFillFactor", 0.5f },
         { "angularDragCoeff", 0.005f },
         { "subSteps", 5f },
+        { "stabilityRollPitchMin", 33f },
+        { "stabilityRollPitchMax", 3300f },
+        { "stabilityYawMin", 2f },
+        { "stabilityYawMax", 23000f },
     };
 
     [Serializable]
