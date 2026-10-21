@@ -18,7 +18,9 @@ using UnityEngine;
 ///   - PX4 velocity/position loops (phase 2): with no horizontal input the drone brakes by
 ///     tilting (velocity setpoint ramped to zero at MPC_ACC_HOR) and then holds position;
 ///     altitude hold through the PX4 vertical loop. Nothing writes the velocity in flight.
-///   - Arm/disarm state: motors off until armed, auto-launch on first arm (kinematic until phase 4)
+///   - Arm/disarm (phase 4): physics takeoff at min(MPC_TKO_SPEED, MPC_Z_VEL_MAX_UP) to
+///     launchHeight; landing at min(MPC_LAND_SPEED, MPC_Z_VEL_MAX_DN) with a land detector;
+///     motors spin up and down through the lag model
 ///
 /// The user-facing API remains unchanged: ForwardSpeed, StrafeSpeed, VerticalSpeed,
 /// YawSpeed as [-1, 1] inputs, plus MaxSpeed as a scaling factor.
@@ -216,18 +218,33 @@ public class Flight : DroneModule
     /// </summary>
     private const float maxTiltCompensation = 1.15f;
 
-    // --------- Launch (kinematic until spec phase 4) ---------
+    // --------- Takeoff and landing (spec phase 4, section 4.5) ---------
 
-    /// <summary>Launch ascent speed gains (m/s per m of altitude error, per m/s of climb).</summary>
-    private const float Kp_alt = 0.5f;
-    private const float Kd_alt = 0.8f;
+    /// <summary>Height above the ground (m) the takeoff climbs to (flight-sim.json launchHeight).</summary>
+    private float launchAltitude = 1.0f;
 
-    // --------- Launch ---------
+    /// <summary>Takeoff climb rate min(MPC_TKO_SPEED, MPC_Z_VEL_MAX_UP) and landing descent rate
+    /// min(MPC_LAND_SPEED, MPC_Z_VEL_MAX_DN), m/s.</summary>
+    private float takeoffSpeed = 0.6f, landSpeed = 0.6f;
 
-    /// <summary>
-    /// Altitude above the starting position (meters) that the drone auto-ascends to on launch.
-    /// </summary>
-    private const float launchAltitude = 7.5f;
+    /// <summary>PX4 smooth takeoff (TakeoffHandling, MPC_TKO_RAMP_T): the climb-rate limit ramps
+    /// from 0 to takeoffSpeed over this time (s) after arming.</summary>
+    private float takeoffRampTime = 3f;
+    private float launchTime;
+
+    /// <summary>Acceleration of the takeoff/landing climb setpoint, jerk-limited at MPC_JERK_MAX (m/s^2).</summary>
+    private float climbAcceleration;
+
+    /// <summary>The takeoff ends once within this distance of its height (m) and this vertical speed (m/s).</summary>
+    private const float LaunchDoneDistance = 0.05f, LaunchDoneSpeed = 0.1f;
+
+    /// <summary>Land detector: ground contact (or thrust at MPC_THR_MIN) with |vertical speed| below
+    /// LandedSpeed for LandedTime seconds disarms.</summary>
+    private const float LandedSpeed = 0.2f, LandedTime = 0.5f;
+    private float landedTimer;
+
+    /// <summary>Set by OnCollisionStay when a collider below the drone touches it; read once per step.</summary>
+    private bool groundContact;
 
     #endregion
 
@@ -335,9 +352,9 @@ public class Flight : DroneModule
     private float groundY = 0f;
 
     /// <summary>
-    /// Arms the drone and begins the auto-launch sequence.
-    /// The drone will ascend to launchAltitude meters above its current position,
-    /// then switch to normal pos-hold / alt-hold flight.
+    /// Arms the drone and begins the physics takeoff: the motors spin up through the lag model
+    /// and the PX4 vertical loop climbs at the takeoff speed to launchAltitude above the
+    /// current position, then holds altitude and position.
     /// </summary>
     public void Arm()
     {
@@ -347,14 +364,10 @@ public class Flight : DroneModule
         IsLanding = false;
         groundY = this.transform.position.y;
         TargetAltitude = this.transform.position.y + launchAltitude;
-
-        // Zero out all velocity and force level attitude so launch goes straight up
-        this.rBody.linearVelocity = Vector3.zero;
-        this.rBody.angularVelocity = Vector3.zero;
-        this.transform.rotation = Quaternion.Euler(0f, this.transform.eulerAngles.y, 0f);
         ResetPositionController();
+        ResetRateController();
 
-        Debug.Log($"[Flight] Armed! Launching to altitude {TargetAltitude:F1}m");
+        Debug.Log($"[Flight] Armed! Launching to altitude {TargetAltitude:F2}m");
     }
 
     /// <summary>
@@ -378,14 +391,16 @@ public class Flight : DroneModule
     }
 
     /// <summary>
-    /// Begins a gentle auto-land sequence. The drone descends under altitude hold
-    /// to the surface below, then fully disarms. Works on any surface (ground, rooftops, etc.).
+    /// Begins the auto-land: the drone descends at the landing speed, holding position, onto
+    /// whatever surface is below (ground, rooftops, etc.), and disarms once the land detector
+    /// sees it resting there.
     /// </summary>
     public void BeginLanding()
     {
         if (!IsArmed || IsLanding) return;
         IsLanding = true;
         IsLaunching = false;
+        this.landedTimer = 0f;
 
         // Clear all user inputs
         this.ForwardSpeed = 0;
@@ -393,21 +408,12 @@ public class Flight : DroneModule
         this.VerticalSpeed = 0;
         this.YawSpeed = 0;
 
-        // Raycast down to find the actual surface below (not just the spawn ground)
-        float landingY = groundY;
-        RaycastHit hit;
-        if (Physics.Raycast(this.transform.position, Vector3.down, out hit, 500f))
-        {
-            landingY = hit.point.y;
-        }
-
-        TargetAltitude = landingY + 0.1f;
-
-        Debug.Log($"[Flight] Landing initiated â€” target surface at Y={landingY:F1}");
+        Debug.Log($"[Flight] Landing initiated - descending at {this.landSpeed:F2} m/s");
     }
 
     /// <summary>
-    /// Fully disarms the drone (called internally when auto-land completes).
+    /// Disarms the drone (called when the land detector triggers). The motors spin down
+    /// through the lag model; nothing writes the velocity.
     /// </summary>
     private void FinishDisarm()
     {
@@ -418,10 +424,19 @@ public class Flight : DroneModule
         this.StrafeSpeed = 0;
         this.VerticalSpeed = 0;
         this.YawSpeed = 0;
-        this.rBody.linearVelocity = Vector3.zero;
-        this.rBody.angularVelocity = Vector3.zero;
-        ZeroMotors();
+        TargetAltitude = this.transform.position.y;
         Debug.Log("[Flight] Landed and disarmed");
+    }
+
+    /// <summary>Ground contact for the land detector: a contact whose normal points up.</summary>
+    private void OnCollisionStay(Collision collision)
+    {
+        for (int i = 0; i < collision.contactCount; i++)
+            if (collision.GetContact(i).normal.y > 0.7f)
+            {
+                this.groundContact = true;
+                return;
+            }
     }
 
     /// <summary>
@@ -502,6 +517,11 @@ public class Flight : DroneModule
 
     private void Start()
     {
+        // Colliders first: the mass properties below are explicit and must be set after any
+        // collider change, which would otherwise make Unity recompute them.
+        if (this.customMass > 0f)
+            AddCustomFrameCollider();
+
         // === Configure Rigidbody for accurate physics ===
         this.rBody.useGravity = true;
         this.rBody.linearDamping = 0f;
@@ -545,26 +565,33 @@ public class Flight : DroneModule
     private void FixedUpdate()
     {
         // ================================================================
-        // 0. ARM CHECK â€” if not armed, zero all motors and do nothing
+        // 0. ARM CHECK â€” if not armed, the motors spin down (lag) and nothing else runs
         // ================================================================
+        bool touchingGround = this.groundContact;
+        this.groundContact = false;
         if (!IsArmed)
         {
-            ZeroMotors();
+            SpinDownStep();
             return;
         }
 
         // ================================================================
-        // 0a. LANDING CHECK â€” if near ground during auto-land, finish disarm
+        // 0a. LAND DETECTOR (PX4-style, simplified): resting on a surface, or the collective
+        //     at MPC_THR_MIN, with low vertical speed for LandedTime -> disarm.
         // ================================================================
         if (IsLanding)
         {
-            float altAboveTarget = this.transform.position.y - TargetAltitude;
-            float vertSpeed = Mathf.Abs(this.rBody.linearVelocity.y);
-
-            // Landed: close to target surface and barely moving vertically
-            if (altAboveTarget < 0.3f && vertSpeed < 0.3f)
+            float collective = 0f;
+            for (int i = 0; i < 4; i++) collective += this.MotorCommands[i];
+            bool resting = touchingGround || collective <= 4f * this.thrMin + 1e-3f;
+            if (resting && Mathf.Abs(this.rBody.linearVelocity.y) < LandedSpeed)
+                this.landedTimer += Time.fixedDeltaTime;
+            else
+                this.landedTimer = 0f;
+            if (this.landedTimer >= LandedTime)
             {
                 FinishDisarm();
+                SpinDownStep();
                 return;
             }
         }
@@ -593,21 +620,25 @@ public class Flight : DroneModule
         this.haveVelocity = true;
 
         // ================================================================
-        // 2. LAUNCH: kinematic ascent until spec phase 4 replaces it with a physics takeoff.
-        //    Horizontal input ends the launch early.
+        // 2. TAKEOFF: physics climb through the vertical loop (section 4 below). Horizontal input
+        //    ends the takeoff early; it completes once at its height and nearly still.
         // ================================================================
         if (IsLaunching)
         {
             if (Mathf.Abs(this.ForwardSpeed) >= StickDeadband || Mathf.Abs(this.StrafeSpeed) >= StickDeadband)
             {
                 IsLaunching = false;
-                ResetPositionController();
+                TargetAltitude = this.transform.position.y;
                 Debug.Log("[Flight] User took over during launch - exiting launch stabilization");
             }
-            else
+            else if (Mathf.Abs(TargetAltitude - this.transform.position.y) < LaunchDoneDistance && Mathf.Abs(velocity.y) < LaunchDoneSpeed)
             {
-                KinematicLaunchStep();
-                return;
+                IsLaunching = false;
+                // Hand over to altitude hold at TargetAltitude (a leftover keyboard climb setpoint
+                // would otherwise re-target the current height).
+                this.climbSetpoint = 0f;
+                this.climbAcceleration = 0f;
+                Debug.Log($"[Flight] Launch complete - entering altitude hold at {this.transform.position.y - this.groundY:F2} m above ground");
             }
         }
 
@@ -617,7 +648,9 @@ public class Flight : DroneModule
         float hoverThrust = mass * gravity;
         float heading = this.transform.eulerAngles.y;
         bool horizontalInput = Mathf.Abs(this.ForwardSpeed) >= StickDeadband || Mathf.Abs(this.StrafeSpeed) >= StickDeadband;
-        bool verticalInput = Mathf.Abs(this.VerticalSpeed) >= StickDeadband;
+        // Takeoff and landing own the vertical axis; throttle input is ignored meanwhile.
+        bool autoVertical = IsLaunching || IsLanding;
+        bool verticalInput = !autoVertical && Mathf.Abs(this.VerticalSpeed) >= StickDeadband;
         bool posCtl = this.Mode == ControlMode.PosCtl;
 
         // ================================================================
@@ -639,7 +672,7 @@ public class Flight : DroneModule
         float accelerationUp = 0f;
         bool directThrust = verticalInput && !posCtl;
         // Keyboard climb release: the climb setpoint ramps back to zero before the altitude locks.
-        bool climbStopping = posCtl && !verticalInput && this.climbSetpoint != 0f;
+        bool climbStopping = posCtl && !verticalInput && !autoVertical && this.climbSetpoint != 0f;
         if (verticalInput || climbStopping)
             TargetAltitude = this.transform.position.y;
         if (directThrust)
@@ -649,12 +682,43 @@ public class Flight : DroneModule
         else
         {
             float vzSetpoint, accelerationFeedForward = 0f;
-            if (verticalInput || climbStopping)
+            if (verticalInput || climbStopping || autoVertical)
             {
-                // Keyboard climb: the setpoint ramps at MPC_ACC_UP_MAX / MPC_ACC_DOWN_MAX, and that
-                // acceleration is fed forward (PX4 trajectory setpoint), so the loop does not overshoot.
+                // Keyboard climb, takeoff and landing: the setpoint ramps at MPC_ACC_UP_MAX /
+                // MPC_ACC_DOWN_MAX, and that acceleration is fed forward (PX4 trajectory setpoint),
+                // so the loop does not overshoot. Takeoff climbs at takeoffSpeed toward TargetAltitude;
+                // landing descends at landSpeed until the land detector disarms.
                 float target = verticalInput ? this.VerticalSpeed * KeyboardMaxClimbRate * scale : 0f;
-                float ramped = Mathf.MoveTowards(this.climbSetpoint, target, (target > this.climbSetpoint ? this.accUpMax : this.accDownMax) * dt);
+                if (IsLaunching)
+                {
+                    this.launchTime += dt;
+                    float climbLimit = this.takeoffSpeed * Mathf.Clamp01(this.launchTime / Mathf.Max(this.takeoffRampTime, dt));
+                    target = Mathf.Clamp(this.zP * (TargetAltitude - this.transform.position.y), -this.zVelMaxDown, climbLimit);
+                }
+                else if (IsLanding)
+                    target = -this.landSpeed;
+                float rampAcceleration = target > this.climbSetpoint ? this.accUpMax : this.accDownMax;
+                float ramped;
+                if (autoVertical)
+                {
+                    // Jerk-limited, as the horizontal ramp, so the climb rate does not overshoot
+                    // when the setpoint stops changing.
+                    float error = target - this.climbSetpoint;
+                    float wanted = Mathf.Sign(error) * Mathf.Min(rampAcceleration, Mathf.Sqrt(2f * this.jerkMax * Mathf.Abs(error)));
+                    this.climbAcceleration = Mathf.MoveTowards(this.climbAcceleration, wanted, this.jerkMax * dt);
+                    float step = this.climbAcceleration * dt;
+                    if (Mathf.Abs(step) >= Mathf.Abs(error) && step * error > 0f)
+                    {
+                        step = error;
+                        this.climbAcceleration = 0f;
+                    }
+                    ramped = this.climbSetpoint + step;
+                }
+                else
+                {
+                    this.climbAcceleration = 0f;
+                    ramped = Mathf.MoveTowards(this.climbSetpoint, target, rampAcceleration * dt);
+                }
                 accelerationFeedForward = (ramped - this.climbSetpoint) / dt;
                 this.climbSetpoint = vzSetpoint = ramped;
             }
@@ -844,40 +908,64 @@ public class Flight : DroneModule
     }
 
     /// <summary>
-    /// Kinematic launch step (to be replaced by the physics takeoff in spec phase 4): moves the
-    /// drone straight up with rBody.Move and holds it level at its heading.
+    /// Disarmed: motor commands are 0 and each motor's thrust decays through the lag model,
+    /// still pushing at its own position until it has spun down.
     /// </summary>
-    private void KinematicLaunchStep()
+    private void SpinDownStep()
     {
-        float altError = TargetAltitude - this.transform.position.y;
-        float vertVel = this.rBody.linearVelocity.y;
-
-        float launchSpeed = Mathf.Clamp(altError * Kp_alt - vertVel * Kd_alt, -maxVerticalThrustFraction * 5f, maxVerticalThrustFraction * 5f);
-        Vector3 newPos = this.transform.position + Vector3.up * launchSpeed * Time.fixedDeltaTime;
-        this.rBody.Move(newPos, Quaternion.Euler(0f, this.transform.eulerAngles.y, 0f));
-
-        this.rBody.linearVelocity = new Vector3(0f, launchSpeed, 0f);
-        this.rBody.angularVelocity = Vector3.zero;
-        ResetRateController();
-
-        // Telemetry only: hold each motor at its share of hover thrust (lever rule), so
-        // the lag model starts from hover when the launch hands over to the motors.
-        float launchHoverThrust = this.rBody.mass * Physics.gravity.magnitude;
+        float dtSub = Time.fixedDeltaTime / this.subSteps;
         for (int i = 0; i < 4; i++)
         {
-            float t = Mathf.Clamp(this.allocation[i, 0] * launchHoverThrust, 0f, this.motorThrustMax);
+            this.MotorCommands[i] = 0f;
+            if (this.MotorThrusts[i] <= 0f) { this.MotorSpeeds[i] = 0f; continue; }
+
+            float sum = 0f, t = this.MotorThrusts[i];
+            for (int s = 0; s < this.subSteps; s++)
+            {
+                t = MotorLagStep(t, 0f, dtSub, this.motorTauUp, this.motorTauDown);
+                sum += t;
+            }
+            if (t < 1e-4f * this.motorThrustMax) t = 0f;
             this.MotorThrusts[i] = t;
-            this.MotorCommands[i] = t / this.motorThrustMax;
             this.MotorSpeeds[i] = Mathf.Clamp(Mathf.Sqrt(t / kf), motorSpeedMin, motorSpeedMax);
+            this.rBody.AddForceAtPosition(this.transform.up * (sum / this.subSteps), this.transform.TransformPoint(this.MotorPositions[i]));
+        }
+    }
+
+    /// <summary>
+    /// Custom frames touch the ground through a convex MeshCollider on the imported mesh (Unity
+    /// simplifies the hull to at most 255 faces); the prefab's box colliders, sized for the stock
+    /// body, are disabled. Falls back to a box around the mesh bounds if the hull cannot be made.
+    /// </summary>
+    private void AddCustomFrameCollider()
+    {
+        CustomFrameLoader loader = this.GetComponent<CustomFrameLoader>();
+        MeshFilter visual = null;
+        foreach (MeshFilter mf in this.GetComponentsInChildren<MeshFilter>(false))
+            if (mf.sharedMesh != null && loader != null && mf.sharedMesh.bounds == loader.CustomFrameBounds)
+                visual = mf;
+        if (visual == null)
+        {
+            Debug.LogWarning("[Flight] Custom frame mesh not found; keeping the prefab's colliders.");
+            return;
         }
 
-        if (Mathf.Abs(altError) < 0.5f && Mathf.Abs(vertVel) < 0.5f)
+        foreach (Collider c in this.GetComponentsInChildren<Collider>(true))
+            if (!c.isTrigger) c.enabled = false;
+
+        MeshCollider hull = visual.gameObject.AddComponent<MeshCollider>();
+        hull.convex = true;
+        hull.sharedMesh = visual.sharedMesh;
+        if (hull.sharedMesh == null || hull.bounds.size.sqrMagnitude <= 0f)
         {
-            IsLaunching = false;
-            TargetAltitude = this.transform.position.y;
-            ResetPositionController();
-            Debug.Log("[Flight] Launch complete - entering altitude hold");
+            Destroy(hull);
+            BoxCollider box = visual.gameObject.AddComponent<BoxCollider>();
+            box.center = visual.sharedMesh.bounds.center;
+            box.size = visual.sharedMesh.bounds.size;
+            Debug.LogWarning("[Flight] Convex hull failed for the custom frame; using a box around its bounds.");
+            return;
         }
+        Debug.Log($"[Flight] Custom frame collider: convex MeshCollider on '{visual.name}', bounds {hull.bounds.size:F4} m");
     }
 
     /// <summary>
@@ -901,6 +989,10 @@ public class Flight : DroneModule
         this.holding = false;
         this.positionLocked = false;
         this.yawLock = float.NaN;
+        this.climbSetpoint = 0f;
+        this.climbAcceleration = 0f;
+        this.landedTimer = 0f;
+        this.launchTime = 0f;
     }
 
     /// <summary>
@@ -1108,6 +1200,10 @@ public class Flight : DroneModule
         this.manualYawRate = FlightConfig.Px4("MPC_MAN_Y_MAX");
         this.accUpMax = FlightConfig.Px4("MPC_ACC_UP_MAX");
         this.accDownMax = FlightConfig.Px4("MPC_ACC_DOWN_MAX");
+        this.launchAltitude = FlightConfig.Sim("launchHeight");
+        this.takeoffSpeed = Mathf.Min(FlightConfig.Px4("MPC_TKO_SPEED"), this.zVelMaxUp);
+        this.landSpeed = Mathf.Min(FlightConfig.Px4("MPC_LAND_SPEED"), this.zVelMaxDown);
+        this.takeoffRampTime = FlightConfig.Px4("MPC_TKO_RAMP_T");
         ResetPositionController();
 
         this.angularDragCoeff = FlightConfig.Sim("angularDragCoeff");

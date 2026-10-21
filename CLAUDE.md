@@ -81,8 +81,9 @@ Spec: `.plans/real-flight-physics-spec.md`; results in DEVLOG 2026-10-20.
 - **Motor positions:** custom frames use the propeller transforms (placed by `CustomFrameLoader`). The stock drone uses an X layout from `armLength` (0.16 m), because its propeller visuals sit at about ±0.72 m and do not match its physics.
 - **Phase 2 (done 2026-10-20):** PX4 velocity/position and vertical loops; released sticks brake by tilting (setpoint ramp at `MPC_ACC_HOR`) then lock position; banking, brake drags, velocity snap and yaw velocity rotation removed. Tests in `Tests/PlayMode/FlightControlTests.cs`.
 - **Phase 3 (done 2026-10-20):** keyboard/controller fly PX4 POSCTL (`Flight.ControlMode`, set in `LevelManager.Update`); sticks are speed up to `KeyboardMaxSpeed` 30 m/s and climb up to `KeyboardMaxClimbRate` 10 m/s at 1.0 × `MaxSpeed` (owner values); `send_pcmd` keeps the tilt meaning.
-- **Still old (phases 4–5):** kinematic launch (`KinematicLaunchStep`), simple drag. Lab regression is deferred to the end.
-- **Tests:** `UAVSim/Assets/Tests/PlayMode/FlightConfigTests.cs`, `FlightMotorTests.cs` (the `Baseline` category is the slow 20 s, 5-frame hover trace), `FlightControlTests.cs` (phase 2), `FlightPosCtlTests.cs` (phase 3). Run them with the Unity CLI, not Unity MCP (owner decision 2026-10-20), with the Editor closed: `"C:\Program Files\Unity\Hub\Editor\6000.4.5f1\Editor\Unity.exe" -batchmode -projectPath UAVSim -runTests -testPlatform PlayMode -testFilter <regex> -testResults <xml> -logFile <log>`.
+- **Phase 4 (built 2026-10-20, awaiting approval):** physics takeoff to 1.0 m (climb limit ramps to 0.6 m/s over `MPC_TKO_RAMP_T`, about 4.6 s); landing at 0.6 m/s with a land detector (ground contact or `MPC_THR_MIN`, slow for 0.5 s); motors spin down on disarm; custom frames get a convex `MeshCollider` added by `Flight.AddCustomFrameCollider` (prefab colliders disabled). Only `Relaunch()` writes velocities.
+- **Still old (phase 5):** simple drag. Lab regression is deferred to the end.
+- **Tests:** `UAVSim/Assets/Tests/PlayMode/FlightConfigTests.cs`, `FlightMotorTests.cs` (the `Baseline` category is the slow 20 s, 5-frame hover trace), `FlightControlTests.cs` (phase 2), `FlightPosCtlTests.cs` (phase 3), `FlightTakeoffLandTests.cs` (phase 4). Run them with the Unity CLI, not Unity MCP (owner decision 2026-10-20), with the Editor closed: `"C:\Program Files\Unity\Hub\Editor\6000.4.5f1\Editor\Unity.exe" -batchmode -projectPath UAVSim -runTests -testPlatform PlayMode -testFilter <regex> -testResults <xml> -logFile <log>`.
 
 ## Wire protocol (LOCKED — do not change either side)
 
@@ -283,7 +284,7 @@ A preset is a saved copy of one import: the STL path, the density, and the fille
 **Not building in this pass:** rename, delete, export or import of presets, sharing presets between machines, and presets for non-quadcopter layouts.
 
 **EXPLICITLY NOT BUILDING — do not add, do not suggest:**
-- mesh preview, preview camera, `RenderTexture`, `MeshCollider`
+- mesh preview, preview camera, `RenderTexture`, a `MeshCollider` for picking (the convex physics-contact `MeshCollider` from real-flight-physics phase 4 is allowed)
 - click-to-place, raycasting
 - add/remove rows by creating or destroying row objects from code, marker objects. (Add/remove by showing and hiding the 12 hand-built rows IS built; see above.)
 - non-quadcopter layouts (hex, octo, plus-configuration)

@@ -48,6 +48,49 @@ implement custom `.stl` drone import:
 
 ---
 
+## 2026-10-20 — Real flight physics, phase 4 (physics takeoff and landing, ground contact)
+
+Spec: `.plans/real-flight-physics-spec.md` §4.5, §4.2 item 7. Not committed; waiting for owner approval.
+
+**Changed (`Flight.cs`):**
+- Takeoff: the kinematic launch (`KinematicLaunchStep`, `rBody.Move`, the velocity and rotation writes in
+  `Arm()`) is removed. The motors spin up through the lag model and the PX4 vertical loop climbs to ground +
+  `launchHeight` (1.0 m). The climb-rate limit ramps from 0 to min(`MPC_TKO_SPEED`, `MPC_Z_VEL_MAX_UP`) =
+  0.6 m/s over `MPC_TKO_RAMP_T` (3 s), as PX4's smooth takeoff does. Without the ramp the climb overshot to
+  0.716 m/s. Takeoff now takes about 4.6 s, not the spec's "about 2 s". The launch ends within 5 cm and
+  0.1 m/s of the height; horizontal input still ends it early.
+- Takeoff and landing setpoints ramp with a jerk limit (`MPC_JERK_MAX`). Throttle input is ignored during both.
+- Landing: descends at min(`MPC_LAND_SPEED`, `MPC_Z_VEL_MAX_DN`) = 0.6 m/s, holding position. Land detector:
+  ground contact (an `OnCollisionStay` contact with normal up) or collective at `MPC_THR_MIN`, with
+  |vertical speed| < 0.2 m/s for 0.5 s, then disarm. The raycast landing target is gone.
+- Disarmed: motors spin down through the lag model (`SpinDownStep`); `FinishDisarm()` writes no velocity.
+  Only `Relaunch()` (respawn) still writes velocities.
+- Custom frames: a convex `MeshCollider` on the imported mesh (`AddCustomFrameCollider`, found by
+  `CustomFrameLoader.CustomFrameBounds`, so `CustomFrameLoader.cs` is unchanged); the prefab's colliders
+  are disabled; a box around the mesh bounds is the fallback.
+- Fixed: after takeoff in PosCtl, a leftover climb setpoint re-targeted the current height (stuck at 0.951 m).
+- `FlightConfig.cs`: `MPC_TKO_RAMP_T` 3.0 added to the built-in fallbacks.
+
+**Tests (Unity CLI):** new `Tests/PlayMode/FlightTakeoffLandTests.cs`. Full PlayMode run without
+`Baseline`: 32 passed, 6 skipped (Drone7Inch / zoom tests), 1 failed (`Pcmd_UnchangedByPosCtl`, then fixed
+and rerun alone: passed, 7.507 m/s of 7.500).
+- `Takeoff_ClimbsUnderThrust`: first-step thrust 15.9 N of 20.0 N commanded (lag); max climb 0.452 m/s
+  (limit 0.6); launch complete after 4.62 s at 0.951 m, 0.985 m 1 s later (target 1.0); no `Move` calls.
+- `Land_DescendsAndDisarms`: default drone max descent 0.628 m/s, disarmed 0.54 s after touchdown; cube
+  0.625 m/s, 0.52 s, resting gap 0.0 mm. Motors at 0 N after disarm. The default drone's 1 m prefab box
+  overlaps the LaunchPad and floor-grid colliders by up to 15 mm (scene, not this phase), so its gap is
+  reported, not asserted.
+- `CustomFrame_RestsOnConvexCollider`: cube and 7-inch rest level, gap 0.0 mm, no other solid colliders.
+- `NoVelocityWritesInFlight`: writes only in `Relaunch`; probe 0.879 × the force-implied limit.
+- `Pcmd_UnchangedByPosCtl` (test changed): at the 1 m takeoff height a scene object about 14 m ahead
+  stopped the keyboard leg, and a wall about 39 m ahead stops it even at 7.8 m. The test now climbs 6.5 m first
+  and measures the steady speed over steps 200–300 instead of 600–700.
+
+**Lab impact to watch:** takeoff is now 1.0 m in about 4.6 s (was 7.5 m, kinematic); landing disarms on
+contact. Lab regression is still deferred to the end.
+
+---
+
 ## 2026-10-20 — Real flight physics, phase 2 (PX4 velocity/position loops, velocity overrides removed)
 
 Spec: `.plans/real-flight-physics-spec.md` §4.3, §4.4 (`Pcmd` path), §4.6.
