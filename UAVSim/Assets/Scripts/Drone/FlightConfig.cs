@@ -52,6 +52,7 @@ public static class FlightConfig
         { "MPC_Z_VEL_MAX_UP", 0.6f },
         { "MPC_Z_VEL_MAX_DN", 0.6f },
         { "MPC_TKO_SPEED", 1.5f },
+        { "MPC_TKO_RAMP_T", 3.0f },
         { "MPC_LAND_SPEED", 0.7f },
         { "MPC_ACC_HOR", 3.0f },
         { "MPC_ACC_HOR_MAX", 5.0f },

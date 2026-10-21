@@ -385,8 +385,9 @@ namespace UAVSim.Tests.PlayMode
                 errors.Add($"{type}: {message}");
         }
 
-        /// <summary>Loads the frame, arms, waits for the launch to finish. One physics step per frame afterwards.</summary>
-        private IEnumerator Fly(Frame frame)
+        /// <summary>Loads the frame, arms, waits for the launch to finish. One physics step per frame afterwards.
+        /// With arm false it stops after loading, with the drone disarmed.</summary>
+        private IEnumerator Fly(Frame frame, bool arm = true)
         {
             if (!frame.IsDefault)
             {
@@ -445,6 +446,7 @@ namespace UAVSim.Tests.PlayMode
             Assert.IsNotNull(flight);
             if (!frame.IsDefault)
                 Assert.IsFalse(errors.Exists(e => e.Contains("Using the default drone")), $"{frame.name} import fell back:\n" + string.Join("\n", errors));
+            if (!arm) yield break;
 
             Call(flight, "Arm");
             yield return Steps(1);

@@ -121,14 +121,21 @@ namespace UAVSim.Tests.PlayMode
             Set(flight, "ForwardSpeed", 0f);
             yield return FastSteps(300);
 
+            // Since phase 4 the takeoff stops at 1 m, where a scene object about 14 m ahead blocks
+            // the keyboard leg; climb to about the old 7.5 m launch height first. A wall about 39 m
+            // ahead still ends the leg, so the steady speed is measured over steps 200-300, by
+            // which time the speed has settled (it reaches the target at about step 120).
+            Set(flight, "TargetAltitude", drone.transform.position.y + 6.5f);
+            yield return FastSteps(1000);
+
             // Keyboard: forward 0.5 is a speed; the drone ends level at that speed.
             SetMode("PosCtl");
             float sum = 0f; int n = 0;
-            for (int f = 0; f < 700; f++)
+            for (int f = 0; f < 300; f++)
             {
                 Set(flight, "ForwardSpeed", 0.5f);
                 yield return Steps(1);
-                if (f >= 600) { sum += Flat3(rb.linearVelocity).magnitude; n++; }
+                if (f >= 200) { sum += Flat3(rb.linearVelocity).magnitude; n++; }
             }
             Set(flight, "ForwardSpeed", 0f);
             float speed = sum / n, speedTarget = 0.5f * KeyboardMaxSpeed() * maxSpeed;

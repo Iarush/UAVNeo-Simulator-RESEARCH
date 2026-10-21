@@ -14,10 +14,8 @@ namespace UAVSim.Tests.PlayMode
     /// </summary>
     public partial class FlightMotorTests
     {
-        /// <summary>Methods that may still write the Rigidbody velocity: Relaunch (respawn), plus
-        /// the takeoff/landing code that spec phase 4 replaces.</summary>
+        /// <summary>Methods that may still write the Rigidbody velocity: Relaunch (respawn) only.</summary>
         private static readonly HashSet<string> VelocityWriters = new HashSet<string> { "Relaunch" };
-        private static readonly HashSet<string> VelocityWritersUntilPhase4 = new HashSet<string> { "Arm", "FinishDisarm", "KinematicLaunchStep" };
 
         [UnityTest]
         public IEnumerator NoVelocityWritesInFlight()
@@ -36,10 +34,10 @@ namespace UAVSim.Tests.PlayMode
                 if (m.Success) current = m.Groups[1].Value;
                 if (!write.IsMatch(code)) continue;
                 found.Add($"{current}:{i + 1}");
-                if (!VelocityWriters.Contains(current) && !VelocityWritersUntilPhase4.Contains(current))
+                if (!VelocityWriters.Contains(current))
                     bad.Add($"Flight.cs:{i + 1} in {current}: {lines[i].Trim()}");
             }
-            Report($"velocity writes: {string.Join(", ", found)} (allowed: Relaunch; until phase 4: {string.Join(", ", VelocityWritersUntilPhase4)})");
+            Report($"velocity writes: {string.Join(", ", found)} (allowed: Relaunch)");
             Assert.IsEmpty(bad, "velocity written in flight:\n" + string.Join("\n", bad));
 
             // 2. Runtime probe: forward, yaw, then release. The velocity change per step must not
