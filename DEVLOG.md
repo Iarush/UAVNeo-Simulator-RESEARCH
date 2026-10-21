@@ -100,9 +100,21 @@ below 0.05 mm by 10 s.
 
 **Not run:** the lab regression report (deferred to the end, owner decision 2026-10-20) and a hand flight.
 
-**Also in the working tree, not part of phase 2:** the phase 3 keyboard path (`Flight.ControlMode`, set in
-`LevelManager.Update` when the simulation mode changes) and `Tests/PlayMode/FlightPosCtlTests.cs`. Its last
-Editor run, before the feed-forward, failed 5 tests on a 7–8% speed and climb overshoot; not re-run since.
+**Phase 3 (keyboard POSCTL), 2026-10-20:** `Flight.ControlMode`, set in `LevelManager.Update` when the
+simulation mode changes (`DefaultFlight` → `PosCtl`, otherwise `Pcmd`). Keyboard limits are the owner's
+`KeyboardMaxSpeed` 30 m/s and `KeyboardMaxClimbRate` 10 m/s at 1.0 × `MaxSpeed`, replacing the spec's
+`MPC_VEL_MANUAL` / `MPC_Z_VEL_MAX_*`. Tests (`FlightPosCtlTests.cs`, Unity CLI): **6 passed, 0 failed.**
+The first CLI run failed 3 tests because at 30 m/s the drone flew into the level (CrashSystem crashes in the
+log), not because of the controller; the tests now turn off every collider except the drone's (`ClearSky`),
+and the release test checks the hold from 10 s to 13 s, because braking from 18 m/s takes longer than the
+old 5 s window.
+- `PosCtl_FullStickSpeed`: 14.964 m/s (expected 15.000) at 0.5; 29.620 (expected 30.000) at 1.0.
+- `PosCtl_ClimbRateLimit`: peak 5.100 m/s (limit 5.000 +5%) at 0.5; 10.063 (10.000) at 1.0.
+- `PosCtl_ReleaseBrakesAndHolds`: released at 17.71 m/s, peak deceleration 5.02 m/s² (limit 5.5), stopping
+  distance 59.6 m (minimum 31.4), 27.0° nose-up, moved 5.8 cm from 10 s to 13 s.
+- `Pcmd_UnchangedByPosCtl`: send_pcmd forward 0.5 → 8.73° (target 8.75); keyboard forward 0.5 → 7.552 m/s
+  (target 7.500).
+Not run: a hand flight.
 
 ---
 
