@@ -81,11 +81,6 @@ HEADER_ERROR = 255
 LISTEN_IP = "127.0.0.1"
 LISTEN_PORT = 5070
 
-# Fallback used only if a request somehow sends density <= 0 (shouldn't
-# happen if the C# side validates its UI input, but the server should not
-# trust the network blindly). PETG, a common 3D-printed frame material.
-FALLBACK_DENSITY_KG_PER_M3 = 1250.0
-
 
 def _parse_request(data: bytes) -> tuple:
     """
@@ -180,11 +175,7 @@ def handle_request(data: bytes) -> bytes:
     try:
         density, stl_path, nodes = _parse_request(data[1:])
         if density <= 0:
-            print(
-                f">> WARNING: received non-positive density ({density}); "
-                f"falling back to {FALLBACK_DENSITY_KG_PER_M3} kg/m^3"
-            )
-            density = FALLBACK_DENSITY_KG_PER_M3
+            raise ValueError(f"density must be > 0 kg/m^3, got {density}")
         # mesh_units is pinned to "mm" because the wire format has no units
         # field: Unity sends a path and a density, and the STL is written by
         # the student's CAD export in millimetres. Declaring it here rather

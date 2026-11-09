@@ -4,6 +4,8 @@ _The MIT Beaver Works UAV simulation environment, based on the [RACECAR Neo Simu
 
 UAVSim is a Unity-based simulator for an educational quadrotor drone. It pairs with the [`uav-neo-library`](https://github.com/MITUavNeo/uav-neo-library) Python control library, which students import to control the simulated (or physical) drone via UDP.
 
+> **Research fork**: this version adds custom STL drone import and PX4-style flight physics. See [Research Additions](#research-additions-custom-frames-and-real-flight-physics).
+
 > **Note**: As of v0.0.3, UAVSim is built using Unity `6000.4.5f1` (Unity 6). Older or newer versions of Unity are not supported. Migration to a newer version of Unity or opening the project in an older version may be risky and cause unexpected results.
 
 ## Table of Contents
@@ -11,6 +13,7 @@ UAVSim is a Unity-based simulator for an educational quadrotor drone. It pairs w
 - [Getting Started](#getting-started)
     - [Manual Flight Controls](#manual-flight-controls)
     - [Visual Check: Drone and Propellers](#visual-check-drone-and-propellers)
+- [Research Additions: Custom Frames and Real Flight Physics](#research-additions-custom-frames-and-real-flight-physics)
 - [Repository Contents](#repository-contents)
     - [Drone Modules](#drone-modules)
 - [Python Interface](#python-interface)
@@ -23,6 +26,35 @@ UAVSim is a Unity-based simulator for an educational quadrotor drone. It pairs w
 ## Changelog
 
 See [CHANGELOG.md](./CHANGELOG.md) for a full version history. Highlights:
+
+Research changes to the original UAVSim, newest first. Dates are from `DEVLOG.md`, `CLAUDE.md` and commit dates.
+
+- **2026-11-09** (uncommitted when written) — Code review of the mass service.
+  - `UAVSim/Assets/MassService~/mass-properties/udp_listener.py` now rejects a density of 0 or less with an error reply. Before, it silently used 1250 kg/m^3.
+  - Added the "Research Additions" section to this README.
+
+- **2026-10-20** — Real flight physics, phases 0 to 5 (branch `feature/real-flight-physics`, spec in `.plans/real-flight-physics-spec.md`). Commits `a2f1146`, `b5c2895`, `244530d`, `bf6d97c`, `71474e8`; the commit dates are all 2026-10-20.
+  - Phases 0-1: `FlightConfig.cs` loads PX4 v1.17.0 params (`uav-neo.params`) and sim-only values (`flight-sim.json`). Motors sized to hover at `MPC_THR_HOVER`, with a first-order lag and one force per motor. PX4 attitude and rate loops with allocation. These replace the 2026-10-14 inertia gain scaling.
+  - Phase 2: PX4 velocity, position and vertical loops. Released sticks brake by tilting, then hold position. Banking, brake drags, velocity snap and yaw velocity rotation removed.
+  - Phase 3: keyboard and controller fly PX4 POSCTL. `send_pcmd` keeps its tilt meaning.
+  - Phase 4 (built, awaiting approval): physics takeoff to 1.0 m, landing with a land detector, motors spin down on disarm, convex `MeshCollider` on custom frames.
+  - Phase 5 (built, awaiting approval): quadratic drag from the frame bounds, stability warning, and a Build Drone stability estimate (`FrameStabilityEstimate.cs`).
+  - Also fixed: `CrashSystem` motor health is now indexed by corner.
+  - Lab regression has not been run yet. It is planned once, after all phases.
+
+- **2026-10-14** — Flight audit follow-up (`72cc2cb`, `3d195d8`).
+  - One motor-corner rule: `MotorQuadrants.ClassifyUnity` is now the only copy. The panel, `CustomFrameLoader` and `PropellerSpin` use it.
+  - Fixed light frames (1.2 kg and 0.28 kg) climbing away: `Flight.cs` attitude gains were scaled by frame inertia. Superseded on 2026-10-20 by the PX4 loops.
+
+- **2026-10-13** — Custom drone frame import (`edc07f5`, `282d53c`, `47d6d13`, `453d3fc`, `f3b9eea`, `d6e99a1`).
+  - Import of a custom `.stl` frame: `StlMeshLoader.cs` (ASCII and binary, mm to m, Z-up to Y-up) and `CustomFrameLoader.cs`. Unity sends the STL path, density and mass nodes by UDP to a local mass service on `127.0.0.1:5070`. The service returns centre of mass, principal moments, inertia rotation and arm length. The wire protocol is fixed. Any failure falls back to the default drone.
+  - Motor layout check (`MotorQuadrants.cs`): exactly four motors, one per corner.
+  - Zoom bar and `DroneCameraZoom.cs` added in `edc07f5`. The bar starts fitted to a custom frame's size.
+  - Bundled Python 3.13 mass service: `MassServiceLauncher.cs` starts it when the import panel opens and stops it on quit. `tools/build-mass-service.ps1` builds the bundle, and `MassServiceBuildStep.cs` copies it into a Windows build. Tested in the Editor only, not in a built player.
+  - One import panel with a scrolling node table and **+ Add Row** / **- Remove Row** (4 to 12 rows), plus **Build Drone** and **Back**. Merged from two panels in `47d6d13`.
+  - Drone presets: `DronePresetStore.cs` and a **Preset Drone config** dropdown with **Save Preset**. Saved to `drone_presets.json` in the persistent data path.
+  - `PythonInterface` no longer logs a `SocketException` on exit (`d6e99a1`).
+  - Mass sanity check: a 100 mm cube matched hand arithmetic for mass, centre of mass and inertia. Hover test of the cube quad and the default drone passed.
 
 - **v1.0.0** - Redesign efforts to labs, autograder, UI, and curriculum. Arena prefab added
   to reinforce theming, as well as standardizing lighting to prevent unwanted scene bakes.
@@ -119,6 +151,77 @@ With the Console open during Play:
 - **Problem:** `defaultBodyObjects is empty` means the stock body will draw on top of your frame.
 
 > **Tip**: Fast-spinning propellers can look slow, stopped, or even backwards on screen because of the frame rate (the "wagon-wheel" effect). If a propeller looks wrong, check its direction in the `[PropellerSpin]` Console line before treating it as a bug.
+
+## Research Additions: Custom Frames and Real Flight Physics
+
+This research project added two things on top of the original UAVSim: importing a custom drone frame from a CAD file, and a flight model closer to a real PX4 quadcopter. The work is on the `feature/real-flight-physics` branch. Project notes are in `CLAUDE.md`, `DEVLOG.md`, `.plans/real-flight-physics-spec.md` and `docs/flight-audit-2026-10-13.md`.
+
+### Custom Drone Frame Import
+
+A student can import their own `.stl` frame and fly it. The goal is a CAD file in and a physically plausible quadcopter out.
+
+On the main menu, open the custom drone panel. Then:
+
+1. Browse to an `.stl` file and enter a material density in kg/m³.
+2. Fill the node table: type, position and mass for each node. Types are motor, battery, flight controller and companion computer. The table starts with 6 rows and can hold 4 to 12. Positions are in the CAD file's Z-up frame, in metres.
+3. Press **Build Drone**. It checks the STL, the density and the rows together.
+4. Optionally save the setup as a preset. The **Preset Drone config** dropdown at the top lists saved presets and fills in the path, density and rows. Presets are stored in `drone_presets.json` in `Application.persistentDataPath`.
+5. Press **Back**, then **Begin** on the main menu.
+
+The mass numbers come from a small Python service:
+
+- Unity sends the STL path, density and nodes to `127.0.0.1:5070` over UDP.
+- The service uses the [`masscompose`](https://pypi.org/project/masscompose/) package. Its two scripts, `udp_listener.py` and `mass_composer.py`, are in `UAVSim/Assets/MassService~/mass-properties/`.
+- Unity starts the service itself when the import panel opens. It uses a bundled Python 3.13 (build it once with `tools/build-mass-service.ps1`; the pinned packages are in `tools/mass-service-requirements.txt`). Unity stops the service when it quits.
+- The service returns the centre of mass, the principal moments of inertia, an inertia rotation and an arm length.
+
+Unity then swaps the default drone body for the STL mesh. It sets the `Rigidbody` centre of mass, inertia tensor and inertia rotation from the reply. It moves the propellers to the motor positions. `CustomFrameLoader.cs` does this work.
+
+If anything fails, Unity logs a clear reason and flies the default drone. Failures include the service being down, a bad STL and an invalid motor layout. The wire protocol is fixed; see `CLAUDE.md` for its exact layout. For the step-by-step check, see [Visual Check: Drone and Propellers](#visual-check-drone-and-propellers).
+
+A cube of known size and density was checked against hand arithmetic for mass, centre of mass and inertia. They matched.
+
+### Real Flight Physics
+
+The original flight model reacted almost instantly. The new model follows PX4 v1.17.0 and applies to every drone, including the default one. It was built in phases 0 to 5. The plan is in `.plans/real-flight-physics-spec.md`.
+
+- **Config:** PX4 parameters from the real drone are in `UAVSim/Assets/StreamingAssets/Flight/uav-neo.params`. `tools/extract-px4-params.py` makes the file from QGroundControl `.tlog` files. Sim-only values are in `flight-sim.json`. `FlightConfig.cs` reads both. Only the real drone's behaviour limits are used, not its hardware.
+- **Attitude and rate control:** PX4's attitude and rate loops and control allocation, run at 250 Hz inside `Flight.cs`. Gains are PX4 stock values.
+- **Motors:** each motor is sized so the drone hovers at `MPC_THR_HOVER`. Each has a first-order lag and pushes at its own position, so the centre of mass and motor layout matter.
+- **Position control:** PX4 velocity, position and vertical loops. Released sticks brake by tilting, then hold position. The keyboard and controller fly PX4 POSCTL. `send_pcmd` keeps its existing tilt meaning.
+- **Takeoff and landing:** a physics takeoff to 1.0 m and a landing at 0.6 m/s with a land detector. Motors spin down on disarm. Custom frames get a convex `MeshCollider` for ground contact.
+- **Drag and stability:** quadratic drag per body axis, sized from the frame's bounds. A warning appears if the frame's control authority is outside the tested band or the rate error oscillates. `FrameStabilityEstimate.cs` gives an estimate at Build Drone.
+
+Status: phases 0 to 3 are done. Phases 4 and 5 are built and awaiting owner approval.
+
+Tests are PlayMode tests in `UAVSim/Assets/Tests/PlayMode/`. Close the Unity Editor and run them with the Unity CLI:
+
+```
+"C:\Program Files\Unity\Hub\Editor\6000.4.5f1\Editor\Unity.exe" -batchmode -projectPath UAVSim -runTests -testPlatform PlayMode -testFilter <regex> -testResults <xml> -logFile <log>
+```
+
+Use `-testCategory "!Sweep"` to skip the slow stability sweep.
+
+### Known Limits
+
+- Windows only. The bundled Python is the Windows embeddable package.
+- Quadcopters in an X layout only: exactly four motors, one per corner. Plus layouts, hex and octo frames are not supported.
+- The loaded mesh is mirrored relative to the CAD file. This is harmless on a symmetric frame and wrong on a chiral one. It is deferred, not fixed.
+- Preset STL paths are absolute. If the file moves, the preset loads with a missing file and the panel says so.
+- The bundled service has been tested in the Editor only, not in a built player.
+
+### Future Work: Labs
+
+The labs have not been re-checked against the new physics. Flight now uses PX4-style control, motor lag, drag and a real takeoff and landing. Timing and behaviour the labs relied on may be different. The labs must be re-run and probably re-tuned.
+
+`send_pcmd` keeps its existing tilt meaning. It was deliberately not changed to the real drone's velocity-setpoint meaning. The lab regression has not been run yet. It is planned once, after all physics phases are approved.
+
+Other open items:
+
+- Click through the import, preset and flight steps by hand.
+- Test a built player on a machine without Python, including Windows Firewall and SmartScreen behaviour.
+- Remove `DebugFrameTestSetup` and the `TestSetup` object in `Main.unity`.
+- The PyPI `masscompose` package asks for Python 3.13 or later. The bundled Python 3.13 covers the sim, but the student's own Python 3.9 environment cannot install it.
 
 ## Repository Contents
 
