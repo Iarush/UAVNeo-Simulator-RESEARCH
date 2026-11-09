@@ -27,34 +27,21 @@ UAVSim is a Unity-based simulator for an educational quadrotor drone. It pairs w
 
 See [CHANGELOG.md](./CHANGELOG.md) for a full version history. Highlights:
 
-Research changes to the original UAVSim, newest first. Dates are from `DEVLOG.md`, `CLAUDE.md` and commit dates.
+Changes made by this research project, newest first.
 
-- **2026-11-09** (uncommitted when written) — Code review of the mass service.
-  - `UAVSim/Assets/MassService~/mass-properties/udp_listener.py` now rejects a density of 0 or less with an error reply. Before, it silently used 1250 kg/m^3.
-  - Added the "Research Additions" section to this README.
+- **2026-11-09** - The mass service now rejects a material density of 0 or less with an error. Before, it used 1250 kg/m^3 without telling the user. Added the "Research Additions" section to this README.
 
-- **2026-10-20** — Real flight physics, phases 0 to 5 (branch `feature/real-flight-physics`, spec in `.plans/real-flight-physics-spec.md`). Commits `a2f1146`, `b5c2895`, `244530d`, `bf6d97c`, `71474e8`; the commit dates are all 2026-10-20.
-  - Phases 0-1: `FlightConfig.cs` loads PX4 v1.17.0 params (`uav-neo.params`) and sim-only values (`flight-sim.json`). Motors sized to hover at `MPC_THR_HOVER`, with a first-order lag and one force per motor. PX4 attitude and rate loops with allocation. These replace the 2026-10-14 inertia gain scaling.
-  - Phase 2: PX4 velocity, position and vertical loops. Released sticks brake by tilting, then hold position. Banking, brake drags, velocity snap and yaw velocity rotation removed.
-  - Phase 3: keyboard and controller fly PX4 POSCTL. `send_pcmd` keeps its tilt meaning.
-  - Phase 4 (built, awaiting approval): physics takeoff to 1.0 m, landing with a land detector, motors spin down on disarm, convex `MeshCollider` on custom frames.
-  - Phase 5 (built, awaiting approval): quadratic drag from the frame bounds, stability warning, and a Build Drone stability estimate (`FrameStabilityEstimate.cs`).
-  - Also fixed: `CrashSystem` motor health is now indexed by corner.
-  - Lab regression has not been run yet. It is planned once, after all phases.
+- **2026-10-20** - Flight now behaves like the real UAV Neo drone. The sim uses the real drone's PX4 flight-controller settings.
+  - Motors take time to speed up and slow down. Air drag grows with speed and frame size.
+  - Takeoff and landing follow real physics. The drone holds its position when you release the sticks.
+  - Light frames that used to climb away now hover.
+  - The sim warns you if a custom frame would be hard to control.
+  - Takeoff, landing, drag and the warning are built but not yet approved. The labs still need re-checking against the new physics.
 
-- **2026-10-14** — Flight audit follow-up (`72cc2cb`, `3d195d8`).
-  - One motor-corner rule: `MotorQuadrants.ClassifyUnity` is now the only copy. The panel, `CustomFrameLoader` and `PropellerSpin` use it.
-  - Fixed light frames (1.2 kg and 0.28 kg) climbing away: `Flight.cs` attitude gains were scaled by frame inertia. Superseded on 2026-10-20 by the PX4 loops.
-
-- **2026-10-13** — Custom drone frame import (`edc07f5`, `282d53c`, `47d6d13`, `453d3fc`, `f3b9eea`, `d6e99a1`).
-  - Import of a custom `.stl` frame: `StlMeshLoader.cs` (ASCII and binary, mm to m, Z-up to Y-up) and `CustomFrameLoader.cs`. Unity sends the STL path, density and mass nodes by UDP to a local mass service on `127.0.0.1:5070`. The service returns centre of mass, principal moments, inertia rotation and arm length. The wire protocol is fixed. Any failure falls back to the default drone.
-  - Motor layout check (`MotorQuadrants.cs`): exactly four motors, one per corner.
-  - Zoom bar and `DroneCameraZoom.cs` added in `edc07f5`. The bar starts fitted to a custom frame's size.
-  - Bundled Python 3.13 mass service: `MassServiceLauncher.cs` starts it when the import panel opens and stops it on quit. `tools/build-mass-service.ps1` builds the bundle, and `MassServiceBuildStep.cs` copies it into a Windows build. Tested in the Editor only, not in a built player.
-  - One import panel with a scrolling node table and **+ Add Row** / **- Remove Row** (4 to 12 rows), plus **Build Drone** and **Back**. Merged from two panels in `47d6d13`.
-  - Drone presets: `DronePresetStore.cs` and a **Preset Drone config** dropdown with **Save Preset**. Saved to `drone_presets.json` in the persistent data path.
-  - `PythonInterface` no longer logs a `SocketException` on exit (`d6e99a1`).
-  - Mass sanity check: a 100 mm cube matched hand arithmetic for mass, centre of mass and inertia. Hover test of the cube quad and the default drone passed.
+- **2026-10-13** - You can import your own `.stl` drone frame and fly it. Enter the material density and the mass and position of each motor, battery and electronics part on one import panel (4 to 12 rows). The sim finds the centre of mass and inertia, swaps in your mesh and moves the propellers to your motor positions. If the import fails, the default drone loads.
+  - Save an import as a preset and pick it from a dropdown later.
+  - The sim starts its own Python mass service from a bundled copy, so you install nothing. This is tested in the Editor only, not in a built player.
+  - A zoom bar fits the camera to the size of the frame.
 
 - **v1.0.0** - Redesign efforts to labs, autograder, UI, and curriculum. Arena prefab added
   to reinforce theming, as well as standardizing lighting to prevent unwanted scene bakes.
