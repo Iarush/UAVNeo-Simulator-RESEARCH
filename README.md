@@ -29,6 +29,8 @@ See [CHANGELOG.md](./CHANGELOG.md) for a full version history. Highlights:
 
 Changes made by this research project, newest first.
 
+- **2026-11-09** - A Windows build of this version is published on the `windows` branch. It includes its own Python for custom frames, so there is nothing to install, and it is what the student installer downloads. Mac and Linux builds are not made.
+
 - **2026-11-09** - The mass service now rejects a material density of 0 or less with an error. Before, it used 1250 kg/m^3 without telling the user. Added the "Research Additions" section to this README.
 
 - **2026-10-20** - Flight now behaves like the real UAV Neo drone. The sim uses the real drone's PX4 flight-controller settings.
@@ -40,7 +42,7 @@ Changes made by this research project, newest first.
 
 - **2026-10-13** - You can import your own `.stl` drone frame and fly it. Enter the material density and the mass and position of each motor, battery and electronics part on one import panel (4 to 12 rows). The sim finds the centre of mass and inertia, swaps in your mesh and moves the propellers to your motor positions. If the import fails, the default drone loads.
   - Save an import as a preset and pick it from a dropdown later.
-  - The sim starts its own Python mass service from a bundled copy, so you install nothing. This is tested in the Editor only, not in a built player.
+  - The sim starts its own Python mass service from a bundled copy, so you install nothing. This works in the Editor. In a Windows build, the bundle is present and the bundled Python answers on port 5070 when started from the build folder. Starting it from the import panel in the build has not been clicked through.
   - A zoom bar fits the camera to the size of the frame.
 
 - **v1.0.0** - Redesign efforts to labs, autograder, UI, and curriculum. Arena prefab added
@@ -195,7 +197,7 @@ Use `-testCategory "!Sweep"` to skip the slow stability sweep.
 - Quadcopters in an X layout only: exactly four motors, one per corner. Plus layouts, hex and octo frames are not supported.
 - The loaded mesh is mirrored relative to the CAD file. This is harmless on a symmetric frame and wrong on a chiral one. It is deferred, not fixed.
 - Preset STL paths are absolute. If the file moves, the preset loads with a missing file and the panel says so.
-- The bundled service has been tested in the Editor only, not in a built player.
+- In a Windows build (2026-11-09) the bundled Python is copied into the player and answers a probe on port 5070 when started from the build folder. Starting it from the import panel in the player, and a machine without Python, have not been tested.
 
 ### Future Work: Labs
 

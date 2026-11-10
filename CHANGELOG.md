@@ -5,6 +5,11 @@ All notable changes to UAVSim are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-11-09
+
+### Added
+- **Windows build on the `windows` branch.** Built from `feature/real-flight-physics`. It includes the bundled Python 3.13 mass service under `StreamingAssets/MassService`, so custom frames need no install. This is what the student installer downloads. Mac and Linux builds are not made.
+
 ## [1.0.0] - 2026-06-27
 
 First standalone release of the UAV/drone simulator. Replaces the inherited

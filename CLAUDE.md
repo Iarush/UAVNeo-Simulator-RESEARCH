@@ -167,7 +167,7 @@ Downstream public methods: `Flight.ApplyCustomMassProperties(Vector3 com, Vector
 
 **Modification policy for `CustomFrameLoader.cs`:** treat as change-by-approval only. It is the whole import pipeline and the only implementation of the wire protocol, so edits carry protocol risk. Ask before editing; do not refactor it opportunistically. The wire protocol itself is LOCKED regardless (see above).
 
-## Auto-launch the Python backend with a bundled Python — BUILT, Editor-tested; built player pending
+## Auto-launch the Python backend with a bundled Python — BUILT, Editor-tested; built player partly checked
 
 Decided and built 2026-10-13 on branch `feature/bundled-mass-service`. Goal: the student never starts the mass service by hand. Unity starts it when the import panel opens, from a Python 3.13 interpreter shipped inside the build, and stops it on quit.
 
@@ -183,7 +183,7 @@ Decided and built 2026-10-13 on branch `feature/bundled-mass-service`. Goal: the
   - The 100 mm cube at 1000 kg/m³ plus the five nodes, then Begin, gave `[CustomFrameLoader] Mass properties: com=(0,0,0) moments=(0.006167,0.006167,0.010667) armLength=0.2121`. `Flight` applied mass 1.7 kg, and the propellers moved to (±0.15, 0, ±0.15).
   - Leaving Play mode killed the service: no bundled `python.exe` was left and port 5070 was free. No errors came from the launcher.
 
-**Not yet verified:** a built player, a machine with no Python, and Windows Firewall/SmartScreen behaviour.
+**Not yet verified:** the service started from the import panel in a built player (item 6 of Order of work lists what was checked on 2026-11-09), a machine with no Python, and Windows Firewall/SmartScreen behaviour.
 
 **Why this route.** Student Python is a WSL2 3.9 venv; the sim is a Windows `.exe`; PyPI `masscompose` needs Python >= 3.13 (see Architecture). A bundled interpreter needs nothing from the student's machine.
 
@@ -256,7 +256,7 @@ UAVSim/Assets/MassService~/            tilde = ignored by the Unity importer (no
 3. ~~`MassServiceLauncher`, path resolver, `ImportPageUI` hook and status line~~ (done)
 4. ~~`IPostprocessBuildWithReport` copy step~~ (done)
 5. ~~Test in the Editor~~ (passed 2026-10-13, see Verified above)
-6. **Test a built player** on a machine with no Python installed (and, if possible, one not previously used for development).
+6. **Test a built player** on a machine with no Python installed (and, if possible, one not previously used for development). Partly done 2026-11-09: a Windows player built with the Unity CLI contains the bundle (`python.exe`, `udp_listener.py`); `UAVSim.exe` launched and stayed running; the bundled `python.exe` started from the build folder answered the 1-byte probe with a 30-byte 255 reply, and no `python.exe` was left after it was killed. Still open: the panel starting the service in the player ("Mass service: ready"), an import and flight in the player, and a machine with no Python.
 7. ~~Update `README.md` and the Visual Check step 2.1~~ (done)
 
 ## Current MVP scope
