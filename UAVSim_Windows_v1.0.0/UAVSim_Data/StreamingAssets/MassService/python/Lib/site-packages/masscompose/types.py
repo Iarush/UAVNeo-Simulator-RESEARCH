@@ -1,0 +1,157 @@
+"""Data shapes passed between the mesh, composition, and export stages.
+
+Everything here is SI: metres, kilograms, kg·m².
+
+Note on validation split: only :class:`PointMass` guards its *values* at
+construction. :class:`MeshBody` and :class:`MassProperties` guard structure
+(shape and dtype) only, so that ``validate.py`` can be handed a deliberately
+malformed tensor to diagnose. Value checks for those two live in ``validate.py``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+
+import numpy as np
+
+__all__ = ["MeshUnits", "PointMass", "MeshBody", "MassProperties"]
+
+
+class MeshUnits(str, Enum):
+    """Create a uniform scale for the mesh based on what units are called.
+    """
+
+    MM = "mm"
+    CM = "cm"
+    M = "m"
+
+    @property
+    def scale(self) -> float:
+        """Scales everything to be on Meters scale"""
+        return _SCALE[self]
+
+    @classmethod
+    def coerce(cls, value: "MeshUnits | str") -> "MeshUnits":
+        """Accept either the enum or its string spelling."""
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(value)
+        except ValueError:
+            valid = ", ".join(repr(u.value) for u in cls)
+            raise ValueError(
+                f"unknown mesh_units {value!r}; expected one of {valid}"
+            ) from None
+
+
+_SCALE = {MeshUnits.MM: 0.001, MeshUnits.CM: 0.01, MeshUnits.M: 1.0}
+
+
+def _as_vector(value, name: str) -> np.ndarray:
+    """Coerce to an immutable float64 array of shape exactly (3,).
+
+    Strict about dimensionality on purpose: a (3, 1) column or (1, 3) row is
+    rejected rather than flattened. Silently accepting either would let a
+    transposed vector travel downstream into the parallel-axis math, where the
+    result is wrong but plausible-looking.
+    """
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.shape != (3,):
+        raise ValueError(f"{name} must have shape (3,), got {arr.shape}")
+    arr = arr.copy()
+    arr.flags.writeable = False
+    return arr
+
+
+def _as_tensor(value, name: str) -> np.ndarray:
+    """Coerce to an immutable float64 array of shape (3, 3)."""
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.shape != (3, 3):
+        raise ValueError(f"{name} must have shape (3, 3), got {arr.shape}")
+    arr = arr.copy()
+    arr.flags.writeable = False
+    return arr
+
+
+def _as_mass(value, name: str) -> float:
+    
+    mass = float(value)
+    if not np.isfinite(mass):
+        raise ValueError(f"{name} must be finite, got {mass!r}")
+    return mass
+
+
+@dataclass(frozen=True, eq=False)
+class PointMass:
+    """A discrete mass at a point, in the same frame as the mesh.
+
+    Equality is not defined (``eq=False``): compare fields with
+    ``np.allclose`` rather than relying on ambiguous array truthiness.
+    """
+
+    position: np.ndarray
+    mass: float
+    name: str | None = None
+
+    def __post_init__(self) -> None:
+        position = _as_vector(self.position, "position")
+        if not np.all(np.isfinite(position)):
+            raise ValueError(
+                f"position must be finite, got {position.tolist()}"
+            )
+        mass = _as_mass(self.mass, "mass")
+        if mass < 0.0:
+            raise ValueError(f"mass must be non-negative, got {mass}")
+        object.__setattr__(self, "position", position)
+        object.__setattr__(self, "mass", mass)
+
+    def __repr__(self) -> str:
+        label = "" if self.name is None else f", name={self.name!r}"
+        return (
+            f"PointMass(position={self.position.tolist()}, "
+            f"mass={self.mass}{label})"
+        )
+
+
+@dataclass(frozen=True, eq=False)
+class MeshBody:
+    """Mass properties of a single mesh, in SI.
+
+    ``inertia`` is about ``com``, not about the frame origin.
+    """
+
+    mass: float
+    com: np.ndarray
+    inertia: np.ndarray
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mass", float(self.mass))
+        object.__setattr__(self, "com", _as_vector(self.com, "com"))
+        object.__setattr__(self, "inertia", _as_tensor(self.inertia, "inertia"))
+
+    def __repr__(self) -> str:
+        return f"MeshBody(mass={self.mass}, com={self.com.tolist()}, inertia=...)"
+
+
+@dataclass(frozen=True, eq=False)
+class MassProperties:
+    """Combined mass properties of a mesh plus its point masses, in SI.
+
+    ``inertia`` is about ``com``.
+    """
+
+    mass: float
+    com: np.ndarray
+    inertia: np.ndarray
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mass", float(self.mass))
+        object.__setattr__(self, "com", _as_vector(self.com, "com"))
+        object.__setattr__(self, "inertia", _as_tensor(self.inertia, "inertia"))
+
+    def __repr__(self) -> str:
+        return (
+            f"MassProperties(mass={self.mass}, com={self.com.tolist()}, "
+            f"inertia=...)"
+        )
