@@ -179,6 +179,7 @@ The original flight model reacted almost instantly. The new model follows PX4 v1
 - **Motors:** each motor is sized so the drone hovers at `MPC_THR_HOVER`. Each has a first-order lag and pushes at its own position, so the centre of mass and motor layout matter.
 - **Position control:** PX4 velocity, position and vertical loops. Released sticks brake by tilting, then hold position. The keyboard and controller fly PX4 POSCTL. `send_pcmd` keeps its existing tilt meaning.
 - **Takeoff and landing:** a physics takeoff to 1.0 m and a landing at 0.6 m/s with a land detector. Motors spin down on disarm. Custom frames get a convex `MeshCollider` for ground contact.
+- **Keyboard flight (phase 6, 2026-11-22):** the keyboard and controller fly PX4's acceleration-based position mode (`MPC_POS_MODE` 4), as the real drone does. Top speed is 10 m/s × MaxSpeed: 5 m/s at the default 0.5, 10 m/s at full. The drone leans at most 15° on every path (the real drone's `MPC_MAN_TILT_MAX`), including `send_pcmd`. A 180° turn at 5 m/s reverses the drone's direction in about 4 s. Rotor drag (PX4 Gazebo x500 coefficient) slows the drone at speed. The plan is in `.plans/posctl-yaw-reversal-spec.md`.
 - **Drag and stability:** quadratic drag per body axis, sized from the frame's bounds. A warning appears if the frame's control authority is outside the tested band or the rate error oscillates. `FrameStabilityEstimate.cs` gives an estimate at Build Drone.
 
 Status: phases 0 to 3 are done. Phases 4 and 5 are built and awaiting owner approval.

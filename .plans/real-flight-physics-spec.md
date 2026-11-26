@@ -323,6 +323,23 @@ Each phase: implement → run its tests through Unity MCP → run the hover regr
   - `StabilityWarning_ShownForOutOfBandFrame`: a deliberately out-of-band frame shows the HUD message and the Console warning; an in-band frame shows none.
   - `BuildDrone_WarnsForOutOfBandEstimate`: the panel status shows the warning for the same frame.
 
+### Phase 6: POSCTL yaw reversal, 15° tilt limit and rotor drag (added 2026-11-22)
+
+Spec: **`.plans/posctl-yaw-reversal-spec.md`** (owner interview 2026-11-22; run to the end without approval
+stops). The owner reported that the keyboard drone keeps flying the old way for a long time after a 180° yaw.
+
+- Phase 0 measured today's code first: the mode-3 setpoint ramp, capped at `MPC_ACC_HOR_MAX`, was the limit,
+  not the velocity loop.
+- Keyboard/controller POSCTL now runs PX4 v1.17.0 `MPC_POS_MODE` 4 (`StickAccelerationXY`, ported in
+  `Drone/StickAccelerationXY.cs`). The mode-3 ramp is kept and selected with `MPC_POS_MODE` 3.
+- `KeyboardMaxSpeed` is 10 m/s × `MaxSpeed`.
+- Tilt is limited to `MPC_MAN_TILT_MAX` 15° on every path, including the send_pcmd combined-tilt clamp. This
+  deliberately deviates from PX4 POSCTL, which uses 45°.
+- Rotor drag uses the PX4 Gazebo x500 coefficient.
+
+This supersedes, for the keyboard path, the §4.4 `PosCtl` speed (`MPC_VEL_MANUAL × MaxSpeed`) and the §4.3
+tilt limit `MPC_TILTMAX_AIR`. It also takes "rotor drag" off the §8 out-of-scope list. Results: DEVLOG 2026-11-22.
+
 ## 6. Test harness rules
 
 - All tests live in `UAVSim/Assets/Tests/PlayMode/` (assembly `UAVSim.Tests.PlayMode`) and follow

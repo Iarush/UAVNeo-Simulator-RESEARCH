@@ -22,6 +22,9 @@ using UnityEngine;
 ///   - Arm/disarm (phase 4): physics takeoff at min(MPC_TKO_SPEED, MPC_Z_VEL_MAX_UP) to
 ///     launchHeight; landing at min(MPC_LAND_SPEED, MPC_Z_VEL_MAX_DN) with a land detector;
 ///     motors spin up and down through the lag model
+///   - Phase 6 (.plans/posctl-yaw-reversal-spec.md): keyboard POSCTL runs PX4 MPC_POS_MODE 4
+///     (StickAccelerationXY.cs) or, with MPC_POS_MODE 3, the smoothed-velocity ramp; tilt limited
+///     to MPC_MAN_TILT_MAX (15 deg) on every path; rotor drag per motor (PX4 Gazebo x500 coefficient)
 ///
 /// The user-facing API remains unchanged: ForwardSpeed, StrafeSpeed, VerticalSpeed,
 /// YawSpeed as [-1, 1] inputs, plus MaxSpeed as a scaling factor.
@@ -121,6 +124,30 @@ public class Flight : DroneModule
     /// </summary>
     private float angularDragCoeff = 0.005f;
 
+    /// <summary>
+    /// Rotor drag (spec .plans/posctl-yaw-reversal-spec.md D8), Gazebo MulticopterMotorModel form:
+    /// per rotor F = -|omega| * c * v_perp, with v_perp the airflow at the rotor across its axis.
+    /// c in this sim's units (N per rad/s per m/s), converted per frame in ConfigureMotors from the
+    /// PX4 x500 coefficient so the force at a given thrust and airspeed matches it.
+    /// </summary>
+    private float rotorDragSim = 0f;
+
+    /// <summary>Per-motor rotor drag summed over the sub-steps (body axes, N).</summary>
+    private readonly Vector3[] rotorDragSum = new Vector3[4];
+
+    /// <summary>
+    /// Rotor drag of one rotor (body axes, N): -|omega| * c * v_perp, omega = sqrt(T / kf) from its
+    /// thrust T, v_perp = <paramref name="airflowBody"/> (rotor velocity through still air) without
+    /// its component along the rotor axis (body up). Zero at zero airspeed.
+    /// </summary>
+    private Vector3 RotorDrag(Vector3 airflowBody, float thrust)
+    {
+        if (this.rotorDragSim <= 0f || thrust <= 0f) return Vector3.zero;
+        airflowBody.y = 0f;
+        float omega = Mathf.Sqrt(thrust / this.kf);
+        return -this.rotorDragSim * omega * airflowBody;
+    }
+
     // --------- PX4 attitude and rate loops (v1.17.0 stock gains, FlightConfig.Px4StockGains) ---------
     // Vectors are in Unity body axes: x = pitch, y = yaw, z = roll.
 
@@ -150,6 +177,22 @@ public class Flight : DroneModule
     private float xyP, xyVelP, xyVelI, xyVelD;   // MPC_XY_P, MPC_XY_VEL_P/I/D_ACC
     private float zP, zVelP, zVelI, zVelD;       // MPC_Z_P, MPC_Z_VEL_P/I/D_ACC
     private float xyVelMax, zVelMaxUp, zVelMaxDown, accHor, tiltMax, thrMin, thrMax;
+
+    /// <summary>
+    /// MPC_TILTMAX_AIR (rad), loaded but not used: real PX4 POSCTL limits the velocity loop to it
+    /// (45 deg), but the owner chose MPC_MAN_TILT_MAX (15 deg) for every path (2026-11-22, spec
+    /// .plans/posctl-yaw-reversal-spec.md D6). <see cref="tiltMax"/> holds that value.
+    /// </summary>
+    private float tiltMaxAir;
+
+    /// <summary>MPC_MAN_TILT_MAX (deg): the send_pcmd combined-tilt clamp (D7). tiltMax is the same in rad.</summary>
+    private float manTiltMaxDeg = 15f;
+
+    /// <summary>
+    /// Smallest mode-4 velocity scale (m/s). MaxSpeed can be lowered to 0 from the keyboard, and the
+    /// PX4 drag coefficient is 2 * MPC_ACC_HOR / velocity scale, so the scale must stay above 0.
+    /// </summary>
+    private const float MinStickVelocityScale = 0.1f;
     private float velManual, manualYawRate;      // MPC_VEL_MANUAL (m/s), MPC_MAN_Y_MAX (deg/s)
     private float accUpMax, accDownMax;          // MPC_ACC_UP_MAX, MPC_ACC_DOWN_MAX (m/s^2)
     private float climbSetpoint;                 // keyboard climb-rate setpoint, ramped (m/s)
@@ -171,9 +214,31 @@ public class Flight : DroneModule
 
     /// <summary>
     /// Keyboard speed (m/s) at 1.0 x MaxSpeed. Replaces the real drone's MPC_VEL_MANUAL (1 m/s),
-    /// which felt too slow to fly by hand; 30 m/s matches the old sim's top speed (owner 2026-10-20).
+    /// which felt too slow to fly by hand. 10 m/s gives 5 m/s at the default MaxSpeed 0.5, about
+    /// the top speed the owner flies the real Neo at (owner 2026-11-22; was 30 m/s from 2026-10-20).
+    /// In MPC_POS_MODE 4 it stands in for MPC_VEL_MANUAL in every StickAccelerationXY formula.
     /// </summary>
-    public const float KeyboardMaxSpeed = 30f;
+    public const float KeyboardMaxSpeed = 10f;
+
+    /// <summary>
+    /// MPC_POS_MODE from uav-neo.params: 4 = PX4 StickAccelerationXY (acceleration based, the real
+    /// drone's setting), 3 = the smoothed-velocity ramp kept as a fallback. Other values: 4, with a warning.
+    /// </summary>
+    private int posMode = 4;
+    private static bool posModeWarned;
+
+    /// <summary>The mode-4 stick shaping while the keyboard path is active; null otherwise (PX4 creates
+    /// the flight task anew when it activates).</summary>
+    private StickAccelerationXY stickAcceleration;
+
+    /// <summary>The velocity setpoint the velocity loop used last step (PX4 _velocity_setpoint_feedback).</summary>
+    private Vector2 velocitySetpointFeedback = new Vector2(float.NaN, float.NaN);
+
+    /// <summary>Horizontal velocity setpoint (world x, z) the velocity loop tracked in the last step (telemetry/tests).</summary>
+    public Vector2 HorizontalVelocitySetpoint { get; private set; }
+
+    /// <summary>Horizontal acceleration feed-forward (world x, z) of the last step (telemetry/tests).</summary>
+    public Vector2 HorizontalAccelerationSetpoint { get; private set; }
 
     /// <summary>
     /// Keyboard climb/descent rate (m/s) at 1.0 x MaxSpeed. Replaces the real drone's
@@ -735,76 +800,123 @@ public class Flight : DroneModule
 
         // ================================================================
         // 5. HORIZONTAL -> ATTITUDE SETPOINT
-        //    Tilt input (send_pcmd meaning): pitch/roll = value x pcmdMaxTiltDeg x MaxSpeed.
-        //    Keyboard (PX4 POSCTL): sticks = velocity target up to MPC_VEL_MANUAL x MaxSpeed in the
-        //    heading frame. In both modes the velocity setpoint ramps toward its target at
-        //    MPC_ACC_HOR (released: zero, then the position locks); the PX4 velocity loop turns
-        //    that into an acceleration, so the drone stops only by tilting.
+        //    Tilt input (send_pcmd meaning): pitch/roll = value x pcmdMaxTiltDeg x MaxSpeed,
+        //    combined tilt clamped at MPC_MAN_TILT_MAX.
+        //    Keyboard (PX4 POSCTL), MPC_POS_MODE 4: StickAccelerationXY turns the sticks into an
+        //    acceleration with a virtual drag (steady speed KeyboardMaxSpeed x MaxSpeed), a brake
+        //    boost on release and a position lock once stopped.
+        //    MPC_POS_MODE 3, and send_pcmd hold: the velocity setpoint ramps toward its target
+        //    (keyboard: KeyboardMaxSpeed x MaxSpeed in the heading frame; released: zero, then the
+        //    position locks). Takeoff and landing use the hold. The PX4 velocity loop turns the
+        //    setpoints into an acceleration, so the drone stops only by tilting.
         // ================================================================
         Quaternion attitudeSetpoint;
+        bool horizontalLoop = false;
+        Vector2 arwVelocityError = Vector2.zero, arwAccelerationSetpoint = Vector2.zero;
+        Vector3 arwBodyUp = Vector3.up;
+        // Keyboard/controller POSCTL with MPC_POS_MODE 4: PX4 FlightTaskManualAcceleration
+        // (StickAccelerationXY). Takeoff and landing keep the hold below, as PX4 runs its own
+        // takeoff and land tasks there; mode 4 activates when the keyboard takes over.
+        bool stickAccelerationPath = posCtl && this.posMode == 4 && !IsLaunching && !IsLanding;
+        if (!stickAccelerationPath)
+            this.stickAcceleration = null;
         if (horizontalInput && !posCtl)
         {
             this.holding = false;
             this.positionLocked = false;
             this.velIntegral.x = this.velIntegral.z = 0f;
-            float desiredPitch = this.ForwardSpeed * maxTiltAngle * scale;
-            float desiredRoll = -this.StrafeSpeed * maxTiltAngle * scale;
-            attitudeSetpoint = Quaternion.Euler(desiredPitch, yawSetpoint, desiredRoll);
+            // send_pcmd meaning unchanged; the combined tilt is clamped at MPC_MAN_TILT_MAX (D7).
+            Vector2 tilt = PcmdTiltSetpoint(this.ForwardSpeed, this.StrafeSpeed, maxTiltAngle, scale, this.manTiltMaxDeg);
+            attitudeSetpoint = Quaternion.Euler(tilt.x, yawSetpoint, tilt.y);
+            this.velocitySetpointFeedback = new Vector2(float.NaN, float.NaN);
+            this.HorizontalVelocitySetpoint = this.HorizontalAccelerationSetpoint = new Vector2(float.NaN, float.NaN);
         }
         else
         {
             Vector2 horizontalVelocity = new Vector2(velocity.x, velocity.z);
             Vector2 position = new Vector2(this.transform.position.x, this.transform.position.z);
-            if (!this.holding)
+            Vector2 velocitySetpoint, accelerationFeedForward;
+            if (stickAccelerationPath)
             {
-                this.holding = true;
-                this.brakeVelocitySetpoint = horizontalVelocity;
-                this.setpointAcceleration = Vector2.ClampMagnitude(new Vector2(acceleration.x, acceleration.z), this.accHor);
-            }
-            Vector2 velocityTarget = Vector2.zero;
-            if (horizontalInput)
-            {
-                Vector3 stick = Quaternion.Euler(0f, yawSetpoint, 0f) * new Vector3(this.StrafeSpeed, 0f, this.ForwardSpeed);
-                velocityTarget = Vector2.ClampMagnitude(new Vector2(stick.x, stick.z), 1f) * this.velManual * scale;
+                if (this.stickAcceleration == null)
+                    ActivateStickAcceleration(horizontalVelocity);
+                StickAccelerationXY sticks = this.stickAcceleration;
+                // D5: KeyboardMaxSpeed x MaxSpeed stands in for MPC_VEL_MANUAL.
+                sticks.VelocityScale = Mathf.Max(this.velManual * scale, MinStickVelocityScale);
+                sticks.TiltLimit = this.tiltMax;
+                sticks.Gravity = gravity;
+                Vector2 stick = horizontalInput ? new Vector2(this.ForwardSpeed, this.StrafeSpeed) : Vector2.zero;
+                // The yaw setpoint is NaN while yawing, so the stick follows the current heading
+                // (Sticks::rotateIntoHeadingFrameXY).
+                sticks.GenerateSetpoints(stick, heading, this.yawLock, position, this.velocitySetpointFeedback, dt);
+                // PositionControl::_positionControl: P on the locked position plus the velocity feed-forward.
+                velocitySetpoint = sticks.PositionLocked
+                    ? Vector2.ClampMagnitude(this.xyP * (sticks.PositionSetpoint - position) + sticks.VelocitySetpoint, this.xyVelMax)
+                    : sticks.VelocitySetpoint;
+                accelerationFeedForward = sticks.AccelerationSetpoint;
+                this.holding = false;
                 this.positionLocked = false;
             }
-            // Jerk-limited ramp (PX4 trajectory, MPC_ACC_HOR / MPC_JERK_MAX): the acceleration builds
-            // up and dies away at MPC_JERK_MAX, so the drone tilts in and out smoothly instead of
-            // stepping. The wanted acceleration shrinks near the target so the setpoint lands on it.
-            Vector2 setpointError = velocityTarget - this.brakeVelocitySetpoint;
-            // MPC_ACC_HOR_MAX for speeding up, turning and braking (owner 2026-10-20: MPC_ACC_HOR felt sluggish).
-            float rampAcceleration = this.accHorMax;
-            Vector2 wantedAcceleration = setpointError.normalized * Mathf.Min(rampAcceleration,Mathf.Sqrt(2f * this.jerkMax * setpointError.magnitude));
-            this.setpointAcceleration = Vector2.MoveTowards(this.setpointAcceleration, wantedAcceleration, this.jerkMax * dt);
-            Vector2 step = this.setpointAcceleration * dt;
-            if (step.magnitude >= setpointError.magnitude && Vector2.Dot(step, setpointError) > 0f)
+            else
             {
-                step = setpointError;
-                this.setpointAcceleration = Vector2.zero;
-            }
-            this.brakeVelocitySetpoint += step;
-            // The ramp's acceleration is fed forward, as PX4 does with the trajectory setpoint.
-            Vector2 accelerationFeedForward = this.positionLocked ? Vector2.zero : step / dt;
-            if (!horizontalInput && !this.positionLocked && this.brakeVelocitySetpoint == Vector2.zero && horizontalVelocity.magnitude < PositionLockSpeed)
-            {
-                this.positionLocked = true;
-                this.lockedPosition = position;
-            }
+                if (!this.holding)
+                {
+                    this.holding = true;
+                    this.brakeVelocitySetpoint = horizontalVelocity;
+                    this.setpointAcceleration = Vector2.ClampMagnitude(new Vector2(acceleration.x, acceleration.z), this.accHor);
+                }
+                Vector2 velocityTarget = Vector2.zero;
+                if (horizontalInput)
+                {
+                    Vector3 stick = Quaternion.Euler(0f, yawSetpoint, 0f) * new Vector3(this.StrafeSpeed, 0f, this.ForwardSpeed);
+                    velocityTarget = Vector2.ClampMagnitude(new Vector2(stick.x, stick.z), 1f) * this.velManual * scale;
+                    this.positionLocked = false;
+                }
+                // Jerk-limited ramp (PX4 trajectory, MPC_ACC_HOR / MPC_JERK_MAX): the acceleration builds
+                // up and dies away at MPC_JERK_MAX, so the drone tilts in and out smoothly instead of
+                // stepping. The wanted acceleration shrinks near the target so the setpoint lands on it.
+                Vector2 setpointError = velocityTarget - this.brakeVelocitySetpoint;
+                // MPC_ACC_HOR_MAX for speeding up, turning and braking (owner 2026-10-20: MPC_ACC_HOR felt sluggish).
+                float rampAcceleration = this.accHorMax;
+                Vector2 wantedAcceleration = setpointError.normalized * Mathf.Min(rampAcceleration,Mathf.Sqrt(2f * this.jerkMax * setpointError.magnitude));
+                this.setpointAcceleration = Vector2.MoveTowards(this.setpointAcceleration, wantedAcceleration, this.jerkMax * dt);
+                Vector2 step = this.setpointAcceleration * dt;
+                if (step.magnitude >= setpointError.magnitude && Vector2.Dot(step, setpointError) > 0f)
+                {
+                    step = setpointError;
+                    this.setpointAcceleration = Vector2.zero;
+                }
+                this.brakeVelocitySetpoint += step;
+                // The ramp's acceleration is fed forward, as PX4 does with the trajectory setpoint.
+                accelerationFeedForward = this.positionLocked ? Vector2.zero : step / dt;
+                if (!horizontalInput && !this.positionLocked && this.brakeVelocitySetpoint == Vector2.zero && horizontalVelocity.magnitude < PositionLockSpeed)
+                {
+                    this.positionLocked = true;
+                    this.lockedPosition = position;
+                }
 
-            Vector2 velocitySetpoint = this.positionLocked
-                ? Vector2.ClampMagnitude(this.xyP * (this.lockedPosition - position), this.xyVelMax)
-                : this.brakeVelocitySetpoint;
+                velocitySetpoint = this.positionLocked
+                    ? Vector2.ClampMagnitude(this.xyP * (this.lockedPosition - position), this.xyVelMax)
+                    : this.brakeVelocitySetpoint;
+            }
+            this.velocitySetpointFeedback = velocitySetpoint;
+            this.HorizontalVelocitySetpoint = velocitySetpoint;
+            this.HorizontalAccelerationSetpoint = accelerationFeedForward;
+
             Vector2 velocityError = velocitySetpoint - horizontalVelocity;
             Vector2 integral = new Vector2(this.velIntegral.x, this.velIntegral.z);
             Vector2 accelerationXY = accelerationFeedForward + this.xyVelP * velocityError + integral - this.xyVelD * new Vector2(acceleration.x, acceleration.z);
-            integral = Vector2.ClampMagnitude(integral + this.xyVelI * velocityError * dt, gravity * Mathf.Tan(this.tiltMax));
-            this.velIntegral.x = integral.x;
-            this.velIntegral.z = integral.y;
 
             // ControlMath::limitTilt + bodyzToAttitude: thrust axis from the horizontal acceleration.
             Vector3 bodyUp = new Vector3(accelerationXY.x, gravity, accelerationXY.y).normalized;
             bodyUp = Vector3.RotateTowards(Vector3.up, bodyUp, this.tiltMax, 0f);
             attitudeSetpoint = AttitudeFromThrustAxis(bodyUp, yawSetpoint);
+
+            // The integral is updated below, once the collective thrust is known (anti-windup).
+            horizontalLoop = true;
+            arwVelocityError = velocityError;
+            arwAccelerationSetpoint = accelerationXY;
+            arwBodyUp = bodyUp;
         }
 
         // Collective thrust (N).
@@ -825,6 +937,25 @@ public class Flight : DroneModule
         }
         float allMotors = 4f * this.motorThrustMax;
         desiredTotalThrust = Mathf.Clamp(desiredTotalThrust, this.thrMin * allMotors, this.thrMax * allMotors);
+
+        if (horizontalLoop)
+        {
+            // PX4 v1.17.0 PositionControl::_velocityControl, horizontal integral with tracking
+            // anti-windup (Rundqwist 1990): when the thrust cannot produce the commanded horizontal
+            // acceleration (tilt limit, thrust limits), the integrator input is reduced by
+            // 2/MPC_XY_VEL_P_ACC x the shortfall. Replaces the earlier clamp of the integral at
+            // g*tan(tilt limit), which PX4 does not have and which wound up once the 15 deg limit
+            // made saturation common (phase 6, DEVLOG 2026-11-22).
+            Vector2 produced = new Vector2(arwBodyUp.x, arwBodyUp.z) * (desiredTotalThrust / mass);
+            Vector2 integralInput = arwVelocityError;
+            if (arwAccelerationSetpoint.sqrMagnitude > produced.sqrMagnitude)
+                integralInput -= (2f / this.xyVelP) * (arwAccelerationSetpoint - produced);
+            if (float.IsFinite(integralInput.x) && float.IsFinite(integralInput.y))
+            {
+                this.velIntegral.x += this.xyVelI * integralInput.x * dt;
+                this.velIntegral.z += this.xyVelI * integralInput.y * dt;
+            }
+        }
 
         // ================================================================
         // 6. PX4 ATTITUDE LOOP (once per FixedUpdate) -> RATE SETPOINT
@@ -848,7 +979,10 @@ public class Flight : DroneModule
         float dtSub = Time.fixedDeltaTime / this.subSteps;
         float globalScale = crashSystem != null ? crashSystem.MotorOutputScale : 1f;
         float[] thrustSum = new float[4];
+        Vector3[] rotorDragSum = this.rotorDragSum;
+        for (int i = 0; i < 4; i++) rotorDragSum[i] = Vector3.zero;
         Vector3 rate = angVelBody;
+        Vector3 velocityBody = this.transform.InverseTransformDirection(velocity);
 
         for (int s = 0; s < this.subSteps; s++)
         {
@@ -868,6 +1002,12 @@ public class Flight : DroneModule
                 thrustSum[i] += t;
                 Vector3 d = this.MotorPositions[i] - this.rBody.centerOfMass;
                 torque += new Vector3(-d.z * t, -spinCW[i] * this.yawMomentPerThrust * t, d.x * t);
+
+                // Rotor drag at this rotor: airflow = body velocity + w x r, minus its component
+                // along the rotor axis (body up), times this rotor's speed (Gazebo form).
+                Vector3 drag = RotorDrag(velocityBody + Vector3.Cross(rate, d), t);
+                rotorDragSum[i] += drag;
+                torque += Vector3.Cross(d, drag);
             }
 
             Vector3 Iw = this.inertiaBody.MultiplyVector(rate);
@@ -886,8 +1026,9 @@ public class Flight : DroneModule
             float wi = Mathf.Clamp(Mathf.Sqrt(this.MotorThrusts[i] / kf), motorSpeedMin, motorSpeedMax);
             this.MotorSpeeds[i] = wi;
 
-            // Each motor pushes along body up at its own position.
-            this.rBody.AddForceAtPosition(this.transform.up * avg, this.transform.TransformPoint(this.MotorPositions[i]));
+            // Each motor pushes along body up at its own position; its rotor drag acts there too.
+            Vector3 motorForce = this.transform.up * avg + this.transform.TransformDirection(rotorDragSum[i] / this.subSteps);
+            this.rBody.AddForceAtPosition(motorForce, this.transform.TransformPoint(this.MotorPositions[i]));
             tauYawReaction += -spinCW[i] * this.yawMomentPerThrust * avg;
             Omega_r += spinCW[i] * wi;
         }
@@ -995,6 +1136,44 @@ public class Flight : DroneModule
         this.climbAcceleration = 0f;
         this.landedTimer = 0f;
         this.launchTime = 0f;
+        this.stickAcceleration = null;
+        this.velocitySetpointFeedback = new Vector2(float.NaN, float.NaN);
+        this.HorizontalVelocitySetpoint = this.HorizontalAccelerationSetpoint = new Vector2(float.NaN, float.NaN);
+    }
+
+    /// <summary>
+    /// PX4 FlightTaskManualAcceleration::activate: a fresh StickAccelerationXY, position unlocked,
+    /// velocity and acceleration from the last trajectory setpoint (the measured velocity if the
+    /// last step had none, e.g. a send_pcmd tilt).
+    /// </summary>
+    private void ActivateStickAcceleration(Vector2 horizontalVelocity)
+    {
+        var sticks = new StickAccelerationXY { AccHor = this.accHor, JerkMax = this.jerkMax, TiltLimit = this.tiltMax };
+        sticks.ResetPosition();
+        Vector2 lastVelocity = this.HorizontalVelocitySetpoint;
+        sticks.ResetVelocity(float.IsFinite(lastVelocity.x) && float.IsFinite(lastVelocity.y) ? lastVelocity : horizontalVelocity);
+        sticks.ResetAcceleration(this.HorizontalAccelerationSetpoint);
+        this.stickAcceleration = sticks;
+    }
+
+    /// <summary>
+    /// send_pcmd tilt (deg): pitch = forward x pcmdMaxTiltDeg x MaxSpeed, roll = -strafe x the same,
+    /// as before; the combined tilt (the length of (pitch, roll)) is clamped at
+    /// <paramref name="limitDeg"/> keeping its direction (spec D7). Below the limit the result is
+    /// exactly the old formula.
+    /// </summary>
+    public static Vector2 PcmdTiltSetpoint(float forward, float strafe, float maxTiltDeg, float scale, float limitDeg)
+    {
+        float desiredPitch = forward * maxTiltDeg * scale;
+        float desiredRoll = -strafe * maxTiltDeg * scale;
+        float combined = Mathf.Sqrt(desiredPitch * desiredPitch + desiredRoll * desiredRoll);
+        if (combined > limitDeg)
+        {
+            float k = limitDeg / combined;
+            desiredPitch *= k;
+            desiredRoll *= k;
+        }
+        return new Vector2(desiredPitch, desiredRoll);
     }
 
     /// <summary>
@@ -1011,6 +1190,16 @@ public class Flight : DroneModule
 
         this.motorThrustMax = this.rBody.mass * Physics.gravity.magnitude / (4f * hover);
         this.kf = this.motorThrustMax / (motorSpeedMax * motorSpeedMax);
+
+        // Rotor drag (D8): the x500 coefficient c is per rad/s of ITS motor (kf_x500). The same
+        // thrust T spins this sim's motor at sqrt(T/kf) instead of sqrt(T/kf_x500), so
+        // c_sim = c * sqrt(kf / kf_x500) gives the same force at the same thrust and airspeed.
+        float rotorDragSource = FlightConfig.Sim("rotorDragCoeff");
+        float rotorDragSourceKf = FlightConfig.Sim("rotorDragMotorConstant");
+        this.rotorDragSim = rotorDragSource > 0f && rotorDragSourceKf > 0f ? rotorDragSource * Mathf.Sqrt(this.kf / rotorDragSourceKf) : 0f;
+        float hoverPerRotor = this.motorThrustMax * hover;
+        Debug.Log($"[Flight] Rotor drag: c {rotorDragSource:E4} (x500, kf {rotorDragSourceKf:E4}) -> c_sim {this.rotorDragSim:E4} N/(rad/s)/(m/s) for kf {this.kf:E4}; " +
+                  $"at hover ({hoverPerRotor:F3} N per rotor) {this.rotorDragSim * Mathf.Sqrt(hoverPerRotor / this.kf):F4} N per m/s per rotor");
 
         // The stock prefab's propeller visuals sit at about 0.72 m, far outside its physical
         // 0.16 m arm and 0.003 kg*m^2 inertia, so only a custom frame (propellers moved onto its
@@ -1410,7 +1599,20 @@ public class Flight : DroneModule
         this.zVelMaxUp = FlightConfig.Px4("MPC_Z_VEL_MAX_UP");
         this.zVelMaxDown = FlightConfig.Px4("MPC_Z_VEL_MAX_DN");
         this.accHor = FlightConfig.Px4("MPC_ACC_HOR");
-        this.tiltMax = FlightConfig.Px4("MPC_TILTMAX_AIR") * Mathf.Deg2Rad;
+        // D6 (owner 2026-11-22): MPC_MAN_TILT_MAX (15 deg) on every path, a deliberate deviation from
+        // PX4 POSCTL, whose velocity loop uses MPC_TILTMAX_AIR (45 deg). See tiltMaxAir.
+        this.tiltMaxAir = FlightConfig.Px4("MPC_TILTMAX_AIR") * Mathf.Deg2Rad;
+        this.manTiltMaxDeg = FlightConfig.Px4("MPC_MAN_TILT_MAX");
+        this.tiltMax = this.manTiltMaxDeg * Mathf.Deg2Rad;
+        int mode = Mathf.RoundToInt(FlightConfig.Px4("MPC_POS_MODE"));
+        if (mode != 3 && mode != 4)
+        {
+            if (!posModeWarned)
+                Debug.LogWarning($"[Flight] MPC_POS_MODE {mode} is not supported (3 or 4); using 4 (acceleration based).");
+            posModeWarned = true;
+            mode = 4;
+        }
+        this.posMode = mode;
         this.thrMin = FlightConfig.Px4("MPC_THR_MIN");
         this.thrMax = FlightConfig.Px4("MPC_THR_MAX");
         this.velManual = KeyboardMaxSpeed;
@@ -1429,6 +1631,7 @@ public class Flight : DroneModule
         this.maxAngularVelocity = 1.5f * Mathf.Max(this.rateMax.x, Mathf.Max(this.rateMax.y, this.rateMax.z));
         ResetRateController();
 
+        Debug.Log($"[Flight] PX4 position control: MPC_POS_MODE {this.posMode}, tilt limit {this.manTiltMaxDeg:F1} deg (MPC_MAN_TILT_MAX), keyboard speed {KeyboardMaxSpeed:F1} m/s x MaxSpeed");
         Debug.Log($"[Flight] PX4 controller: attitude P (pitch, yaw, roll) {this.attitudeP}, yaw weight {this.yawWeight}, " +
                   $"rate max {this.rateMax * Mathf.Rad2Deg} deg/s, rate P {this.rateP:F3} I {this.rateI:F3} D {this.rateD:F4}");
     }

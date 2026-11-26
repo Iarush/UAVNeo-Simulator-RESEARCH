@@ -13,6 +13,8 @@
     { "key": "stabilityRollPitchMin", "value": 33, "source": "phase 5 sweep 2026-10-20: stock drone roll/pitch inertia scaled; stable 52..2093, unstable at 21 and 5232; bounds are the geometric midpoints (rad/s^2 per unit normalised torque)" },
     { "key": "stabilityRollPitchMax", "value": 3300, "source": "phase 5 sweep 2026-10-20, see stabilityRollPitchMin" },
     { "key": "stabilityYawMin", "value": 2, "source": "phase 5 sweep 2026-10-20: yaw stable from 2 (lowest tested) to 16350, oscillates at 32700" },
-    { "key": "stabilityYawMax", "value": 23000, "source": "phase 5 sweep 2026-10-20, see stabilityYawMin" }
+    { "key": "stabilityYawMax", "value": 23000, "source": "phase 5 sweep 2026-10-20, see stabilityYawMin" },
+    { "key": "rotorDragCoeff", "value": 8.06428e-05, "source": "PX4 Gazebo x500 rotorDragCoefficient (N per rad/s per m/s), https://github.com/PX4/PX4-gazebo-models/blob/b6127f4ec20de867e215fb5f78ae88b80f371909/models/x500/model.sdf (the PX4-gazebo-models commit PX4 v1.17.0 pins in Tools/simulation/gz). Model form (gz-sim MulticopterMotorModel): per rotor F = -|omega| * c * v_perp, v_perp = air velocity at the rotor minus its component along the rotor axis. Converted per frame in Flight.ConfigureMotors so the force per rotor at a given thrust T and airspeed matches x500: c_sim = c * sqrt(kf_sim / rotorDragMotorConstant), since omega = sqrt(T/kf). Default drone: kf_sim 6.2126e-06, c_sim 6.8747e-05; at hover (4.905 N per rotor) 0.0611 N per m/s per rotor in both models" },
+    { "key": "rotorDragMotorConstant", "value": 8.54858e-06, "source": "PX4 Gazebo x500 motorConstant (N per (rad/s)^2), same file as rotorDragCoeff; used only to convert rotorDragCoeff to this sim's per-frame kf" }
   ]
 }

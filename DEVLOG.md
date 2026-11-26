@@ -48,6 +48,155 @@ implement custom `.stl` drone import:
 
 ---
 
+## 2026-11-22 — Real flight physics, phase 6 (POSCTL yaw reversal, 15° tilt limit, rotor drag)
+
+Spec: `.plans/posctl-yaw-reversal-spec.md` (owner interview 2026-11-22, run to the end without approval stops).
+Branch `feature/real-flight-physics`, not committed. All tests were run with the Unity CLI with the Editor closed.
+
+**Owner's report:** flying the default drone with the keyboard at MaxSpeed 0.5, holding forward and yawing 180° left
+the drone flying the old way for a long time. The owner also wanted the tilt limited to 15°.
+
+### Phase 0: measured before any flight change
+
+Test `FlightYawReversalTests.YawReversal_Trace`, default drone, PosCtl. The test flies forward until the speed is
+steady (within 2 % for 1 s), then yaws 180° at full yaw stick while still holding forward, then holds forward. The
+CSV trace has t, position, velocity, velocity and acceleration setpoints, tilt, heading and the 4 motor thrusts.
+
+| MaxSpeed | cruise | 180° yaw | t_half | overshoot | max tilt | altitude change | largest \|v_sp − v\| | setpoint→velocity lag | floor (heading) | floor (direct) | t_half / floor |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0.5 | 14.93 m/s | 1.26 s | **5.24 s** | 32.8 m | 29.8° | 0.048 m | 0.65 m/s | 0.12 s | 2.64 s | 2.24 s | **1.98** |
+| 1.0 | 29.20 m/s | 1.24 s | 9.72 s | 111.0 m | 38.0° | 0.235 m | 1.29 m/s | 0.20 s | 4.51 s | 4.17 s | 2.16 |
+
+**Floor calculation.** The floor is a point mass with the drone's 2.000 kg. Its horizontal thrust acceleration is at
+most g·tan(tilt limit): 9.81·tan 45° = 9.81 m/s² then, 9.81·tan 15° = 2.63 m/s² now. It always pushes toward the
+target velocity. The drag on it is the drone's body drag per heading axis (Cd 1.0, front 0.0157 m², side 0.0239 m²),
+plus the rotor drag once there was any. It starts at the cruise velocity along the old heading. In the "heading"
+version the target is cruise × the heading, which turns at `MPC_MAN_Y_MAX` 150°/s to 180° (what the stick asks
+for). In the "direct" version it is the final velocity from t = 0. The model is integrated at 1 ms until the speed
+along the new heading reaches 0.5 × cruise (`FlightYawReversalTests.PhysicsFloor`).
+
+Hand check at MaxSpeed 0.5: the velocity must change by 14.93 + 7.47 = 22.4 m/s, which takes 22.4 / 9.81 = 2.28 s.
+Body drag helps the start of the braking (about 1.1 m/s² at 15 m/s), so the integration gives 2.24 s.
+
+**Interpretation (spec rule): the controller was also at fault.** t_half was 1.98 × the floor (the rule's limit is
+1.5 ×). It was not velocity tracking: the drone followed its setpoint within 0.12 s. The mode-3 setpoint ramp itself
+was the limit. Its acceleration sat at `MPC_ACC_HOR_MAX` = 5.00 m/s² for 276 of the 389 steps after the yaw started,
+while the 45° tilt allowed 9.81 m/s². That ramp is how PX4 mode 3 behaves. The PX4-faithful fix is the real drone's
+mode 4, where the stick's acceleration (2·`MPC_ACC_HOR` = 6 m/s² plus the virtual drag) is always above the 15° tilt
+cap, so the tilt, i.e. the physics, becomes the limit. No gain was retuned.
+
+The hover baseline before the change is in `Baseline_HoverTrace`, 7/7 passed with the reversal tests. Over 20 s,
+the max altitude error and drift were:
+
+| Frame | Altitude error | Drift |
+|---|---|---|
+| Default drone | 47.26 mm | 36.24 mm |
+| Cube | 46.42 mm | 0.00 mm |
+| 7-inch | 45.17 mm | 31.24 mm |
+| Yaw-light | 38.66 mm | 0.68 mm |
+| Small | 46.35 mm | 0.00 mm |
+
+The 47 mm is the launch settling at t = 0.
+
+### What changed
+
+- **Tilt limit 15° everywhere (D6, D7).** `FlightConfig` reads `MPC_MAN_TILT_MAX` (15, from the real drone's params).
+  `Flight.tiltMax` uses it for the velocity loop's `limitTilt`, the hold, takeoff, landing and the mode-4
+  `applyTiltLimit`. `MPC_TILTMAX_AIR` (45°) is still loaded as `tiltMaxAir` but not used. This is a deliberate
+  deviation from PX4 POSCTL, which uses `MPC_TILTMAX_AIR`.
+- **send_pcmd** keeps its formula (`Flight.PcmdTiltSetpoint`). Only the combined tilt |(pitch, roll)| is clamped at
+  15°, keeping its direction.
+- **Rotor drag (D8).** Per motor, in the sub-stepped loop: `F = −|ω|·c·v⊥`. The airflow at the rotor is the body
+  velocity plus ω × r, with the component along the rotor axis removed. ω = √(T/kf) from that motor's thrust. The
+  force is applied at the motor position, and its torque is included in the sub-step rate propagation. The existing
+  body drag is kept.
+  - **Source:** PX4 Gazebo x500 `rotorDragCoefficient` 8.06428e-05 with `motorConstant` 8.54858e-06,
+    https://github.com/PX4/PX4-gazebo-models/blob/b6127f4ec20de867e215fb5f78ae88b80f371909/models/x500/model.sdf.
+    That is the PX4-gazebo-models commit PX4 v1.17.0 pins. The formula is the one in gz-sim
+    `MulticopterMotorModel.cc` (from Martin & Salaün 2010).
+  - **Conversion:** the same thrust spins the sim's motor at √(T/kf_sim) instead of √(T/kf_x500), so
+    c_sim = c·√(kf_sim / kf_x500).
+  - **Default drone:** kf_sim = 9.81 N / 1256.6² = 6.2126e-06, so c_sim = 6.8747e-05 N per rad/s per m/s. At hover
+    (4.905 N, ω = 888.6 rad/s) that is 0.0611 N per m/s per rotor. The x500 at the same thrust (ω = 757.5 rad/s)
+    also gives 0.0611.
+  - **Sanity check at 5 m/s, default drone:** rotor drag 1.222 N, body drag 0.240 N, total 1.462 N = 0.73 m/s²
+    (0.075 g), well below the 2.63 m/s² the 15° tilt gives. Measured: at a steady 4.98 m/s the drone holds 4.258°
+    of tilt, so g·tan(4.258°)·2 kg = 1.461 N.
+  - Both values are in `flight-sim.json` (`rotorDragCoeff`, `rotorDragMotorConstant`) with the source URL.
+- **Mode 4 (D2–D5).** `Drone/StickAccelerationXY.cs` is a port of PX4 v1.17.0 `StickAccelerationXY.cpp/.hpp`. It
+  includes the parts of the helpers it calls: `Sticks::limitStickUnitLengthXY` and `rotateIntoHeadingFrameXY` (yaw
+  setpoint if finite, else the current yaw), `SlewRate`, `AlphaFilter`, and `math::sqrt_linear` / `interpolate`.
+  It covers the virtual drag 2·`MPC_ACC_HOR`/scale, the brake boost (0.8 s, toward max(2, √scale)), the √ boost
+  below 1 m/s, the sign-change guard, the jerk limit before the tilt limit, and the position lock.
+  - **Sim substitutions:** `KeyboardMaxSpeed` × MaxSpeed replaces `MPC_VEL_MANUAL` everywhere. There is no dynamic
+    velocity constraint. The tilt limit is `MPC_MAN_TILT_MAX`. The sim's own gravity is used. The velocity scale is
+    floored at 0.1 m/s, because MaxSpeed can go to 0.
+  - **Not ported:** stick expo, collision prevention, and side/back scaling (which is −1 on the real drone anyway).
+  - **In `Flight`:** mode 4 runs for PosCtl when not taking off or landing. On activation it takes the velocity and
+    acceleration from the last setpoint, as `FlightTaskManualAcceleration::activate` does. When locked, the
+    position setpoint goes through `xyP`, and its acceleration is fed forward.
+  - **Mode selection:** `MPC_POS_MODE` 3 selects the old ramp, and any other value gives 4 with a warning.
+    `KeyboardMaxSpeed` is 30 → 10 m/s.
+- **Velocity-loop anti-windup (controller fix found while testing).** With 15° the horizontal velocity loop
+  saturates often. The sim clamped the horizontal integral at g·tan(tilt). PX4 v1.17.0
+  `PositionControl::_velocityControl` has no such clamp: it uses tracking anti-windup,
+  `vel_error −= 2/MPC_XY_VEL_P_ACC · (acc_sp − acc_produced)` while saturated. With the clamp, the mode-3 fallback
+  `PosCtl_ReleaseBrakesAndHolds` failed: the drone moved 21.1 cm in the 10–13 s hold window. After porting PX4's
+  anti-windup (`Flight.FixedUpdate`, after the collective thrust), it moved 0.9 cm. No test assertion was changed
+  for this.
+
+### Acceptance checks (spec §6), after the change
+
+| # | Check | Measured | Result |
+|---|---|---|---|
+| 1 | Yaw reversal, MaxSpeed 0.5, mode 4: t_half ≤ 4.0 s | **3.80 s** with the phase-0 cruise rule (cruise 4.77 m/s). Measured against a full 5.0 m/s (threshold 2.5 m/s): 3.86 s. From a settled 15 s cruise (4.98 m/s): 3.86 s. Floor 2.96 / 3.06 s (heading), ratio 1.29 / 1.26. Overshoot 7.8 m. Lag 0.16 s | PASS |
+| 1 | MaxSpeed 1.0 (numbers only) | t_half 6.84 s, overshoot 25.9 m, cruise 9.40 m/s (still rising at the 2 % rule), floor 5.21 s, ratio 1.31 | — |
+| 2 | Cruise speed 5.0 m/s ± 5 % at MaxSpeed 0.5 | 4.977 m/s after 15 s. With the phase-0 "2 % for 1 s" rule the yaw starts at 4.77 m/s, because mode 4 approaches its speed exponentially (setpoint time constant 1/1.2 s) | PASS |
+| 3 | Tilt ≤ 15.5° on every path | takeoff 1.47°, landing 0.45°, keyboard full stick (MaxSpeed 1) 15.00°, diagonal 14.99°, release braking 13.08°, yaw reversal 14.99° / 15.00°, send_pcmd pitch 1 + roll 1 at MaxSpeed 1 14.95°, send_pcmd hold 14.98° | PASS |
+| 4 | Release braking from 5 m/s: stops, locks, no oscillation | From 4.81 m/s: stopped (velocity ≤ 0) after 4.64 s in 6.07 m, peak deceleration 2.61 m/s². The position locked at 2.42 s, when the setpoint reached zero, with 1 lock event, still locked at the end. The drone carried 12.1 cm past the lock point, then settled back without crossing it (0 overshoots), 4.4 cm away at 12 s | PASS (note the 12 cm carry past the lock point) |
+| 5 | Altitude change during the reversal ≤ 0.5 m | 0.019 m (0.045 m at MaxSpeed 1.0) | PASS |
+| 6 | Hover unchanged (`Baseline`) | 5/5 pass the test's assertion (altitude error < 1 m), but the numbers are **not identical**. The steady hover matches: at 10 s and 15 s the motor speeds agree within 0.05 rad/s and the altitude error within 0.25 mm. The launch transient changed. 20 s max altitude error / drift, before → after: default 47.26/36.24 → 47.31/5.63 mm, cube 46.42/0.00 → 36.30/0.00, 7-inch 45.17/31.24 → 36.59/0.00, yaw-light 38.66/0.68 → 37.22/0.00, small 46.35/0.00 → 39.30/0.00. Likely causes: rotor drag on the takeoff's small horizontal motion, and the anti-windup. Not isolated | PASS on the assertion; not bit-identical (launch transient) |
+| 7 | Custom frames, stability band | `Hover_ThrottleIsThrHover` default / cube / 7-inch: u 0.5000, altitude error 0.50 / 0.17 / 0.25 cm. `LightFrames_DoNotClimbAway` yaw-light / small: u 0.5000, 0.04 / 0.33 cm. `OffCentreCom` lever rule 59.80 % = 59.80 %. `StabilityWarning_*` and `BuildDrone_Warns*` unchanged: stock (1046, 327, 1046) no warning; cube (574, 156, 574) none; short-arm roll 4 warns. `Drag_ScalesWithArea` ratio 0.728, was 0.707: rotor drag adds a linear term. Still within 0.707 ± 10 %, so its assertion was **not** changed. `Drone7InchTests`: 5/6 pass. `Propellers_FollowTheirOwnMotor_DuringYaw` fails, and this is **pre-existing**: on HEAD's flight code it fails the same way (yaw motor split 0.037 vs the test's 0.3; with phase 6 it is 0.064). This suite needs the mass service up before its fixture starts, so earlier full runs skipped it | PASS (one pre-existing 7-inch failure) |
+| 8 | Mode-3 fallback: `FlightPosCtlTests` | With `MPC_POS_MODE` forced to 3, final code: full stick 4.946 / 9.746 m/s (expected 5 / 10 ± 5 %); climb 5.076 / 9.885 m/s; release from 7.48 m/s holds within 0.9 cm (before the anti-windup: 21.1 cm, FAIL); keyboard forward 0.5 gives 2.393 m/s (expected 2.5 ± 5 %, close to the 2.375 bound; 2.493 before the anti-windup). No assertion changed: the expected speeds read `KeyboardMaxSpeed` by reflection, so 30 → 10 needed no edit. Only `ForcePosMode(3)` was added, plus a comment. `FlightControlTests` (send_pcmd path, not affected by `MPC_POS_MODE`) 8/8 pass. Hold from 1.02 m/s: peak deceleration 2.45 m/s², 0.1 cm in the hold window. Pitch/roll 1.0 now tilt 15.0° (was 35 × 0.5 = 17.5°). PcmdTilt 63 % at 153 ms | PASS |
+| 9 | Mode-4 unit tests | First step from rest: acc 0.16 m/s², vel 0.0032 m/s. Drag coefficient 1.2 = 2·3/5. Steady 5.00000 m/s with drag 6.0. Steady 10.0000 at scale 10. Boost 1.030148 after one released step (hand value 1.030148), 2.23606 after 10 s (√5 = 2.23607), 2.00000 at scale 1. Jerk ≤ 0.16 per step. \|acc\| ≤ 2.62858 (the tan 15°·g cap). Heading frame: current yaw while yawing, yaw setpoint when locked | PASS |
+| 10 | send_pcmd below 15° bit-identical | 9394 commands on a 41×41×10 grid bit-identical; 7416 above 15° clamped to exactly 15° in the same direction; 0 wrong. Pitch 1 + roll 1 at MaxSpeed 1 → (10.607°, −10.607°) | PASS |
+
+### Test runs (Unity CLI, Editor closed)
+
+| Run | Tests | Result |
+|---|---|---|
+| Phase 0 (before the change) | `YawReversal_Trace` ×2, `Baseline_HoverTrace` ×5 | 7/7 passed |
+| u1 | `StickAccel_*`, `Pcmd_TiltBelowLimitUnchanged`, `FlightConfigTests` | 6/7. The send_pcmd test failed on its own direction check (`Vector2.Angle` too coarse); the test was fixed |
+| yr1 | category `YawReversal` | 7/7 passed |
+| r2 | `CruiseSpeed_AndReversalFromSettledCruise`, `FlightPosCtlTests` (mode 3) | 6/7: `PosCtl_ReleaseBrakesAndHolds` moved 21.1 cm. Fixed by the anti-windup |
+| r3 (after the anti-windup) | `PosCtl_ReleaseBrakesAndHolds`, `YawReversal_Trace` ×2, `ReleaseBraking_StopsAndLocks`, `TiltLimit_AllPaths`, `CruiseSpeed_AndReversalFromSettledCruise` | 6/6 passed |
+| r4a | `Crash_Detached…`, `Hold_StopsByTilting`, `Hover_ThrottleIsThrHover` ×3 | 5/5 passed |
+| r4b | `LightFrames_*` ×2, `MotorLag_*`, `NoVelocityWritesInFlight`, `OffCentreCom_*` | 5/5 passed |
+| r4c | `PcmdTilt_StepResponse`, `PcmdYaw_RateAndNoBank`, `Pitch_*`, `Roll_*`, `Saturation_*`, `TurnKeepsMomentum`, `Yaw_RightCommandYawsRight` | 7/7 passed |
+| r5 | category `Baseline` | 5/5 passed |
+| r6 | `FlightTakeoffLandTests` | 3/5. `Land_DescendsAndDisarms_DefaultDrone` / `_Cube` failed with max descent 0.634 / 0.633 m/s against the 0.63 limit. Pre-existing: the phase-5 run recorded 0.633 / 0.632 and the owner decided not to loosen it |
+| r7 | `Drag_ScalesWithArea`, `StabilityWarning_*` ×2, `BuildDrone_WarnsForOutOfBandEstimate` | 4/4 passed |
+| r8 | `Drone7InchTests` | 6 skipped: no mass service before the fixture |
+| r8b (bundled service started first) | `Drone7InchTests` | 5/6. `Propellers_FollowTheirOwnMotor_DuringYaw` failed; it also fails on HEAD (run r8c, flight files temporarily restored to HEAD and put back afterwards) |
+| u2 (final code) | `StickAccel_*`, `Pcmd_TiltBelowLimitUnchanged`, `FlightConfigTests` | 7/7 passed |
+| r2b (final code) | `PosCtl_FullStickSpeed` ×2, `PosCtl_ClimbRateLimit` ×2, `Pcmd_UnchangedByPosCtl` | 5/5 passed |
+
+**On the final code:**
+- **Passing:** every `YawReversal`, `FlightPosCtlTests`, `FlightControlTests`, `FlightMotorTests` (incl. `Baseline`),
+  `FlightConfigTests` and `FlightDragStabilityTests` test (sweep not run).
+- **Failing, all pre-existing:** the two landing-speed tests, and 1 of the 6 `Drone7InchTests`.
+
+**Test changes:**
+- **New:** `FlightYawReversalTests.cs`, 8 tests, category `YawReversal`.
+- **Changed:** `FlightPosCtlTests.cs` only, where `ForcePosMode(3)` was added to each test and the header and
+  ClearSky comments were updated. No existing assertion was changed.
+
+**Memory:** two runs were stopped by Claude Code because the machine ran low on memory: the first `YawReversal`
+attempt, and r4. Unity's memory grows over repeated scene loads (4 → 6 GB). After that, runs were kept to about 5
+tests, started with a PID kept, and checked for at least 4500 MB free.
+
+**Not run:** the `Sweep` category, and the lab regression (deferred to the end of all phases, owner decision).
+
 ## 2026-10-20 — Real flight physics, phase 5 (frame-scaled drag, stability warnings)
 
 Spec: `.plans/real-flight-physics-spec.md` §4.2 item 6 and §4.7. Awaiting owner approval; not committed.

@@ -7,15 +7,17 @@ namespace UAVSim.Tests.PlayMode
 {
     /// <summary>
     /// Phase 3 of .plans/real-flight-physics-spec.md: the keyboard/controller path (PX4 position
-    /// mode). Uses the flight harness in FlightMotorTests.cs.
+    /// mode). Since phase 6 (.plans/posctl-yaw-reversal-spec.md) these run with MPC_POS_MODE forced
+    /// to 3, the smoothed-velocity fallback; mode 4 is tested in FlightYawReversalTests.cs.
+    /// Uses the flight harness in FlightMotorTests.cs.
     /// </summary>
     public partial class FlightMotorTests
     {
         private static float KeyboardMaxSpeed() => (float)GameType("Flight").GetField("KeyboardMaxSpeed").GetRawConstantValue();
 
         /// <summary>
-        /// Keyboard speeds reach 30 m/s, so these tests cover hundreds of metres and would hit the
-        /// level. Every collider except the drone's is turned off so they measure flight, not crashes.
+        /// Keyboard speeds reach 10 m/s (30 m/s before phase 6), so these tests cover tens of metres and
+        /// would hit the level. Every collider except the drone's is turned off so they measure flight, not crashes.
         /// </summary>
         private void ClearSky()
         {
@@ -30,6 +32,7 @@ namespace UAVSim.Tests.PlayMode
             yield return Fly(DefaultDrone());
             ClearSky();
             SetMode("PosCtl");
+            ForcePosMode(3); // acceptance check 8: the MPC_POS_MODE 3 fallback
             Set(flight, "MaxSpeed", maxSpeed);
             yield return FastSteps(50);
             float sum = 0f;
@@ -52,6 +55,7 @@ namespace UAVSim.Tests.PlayMode
         {
             yield return Fly(DefaultDrone());
             SetMode("PosCtl");
+            ForcePosMode(3); // acceptance check 8: the MPC_POS_MODE 3 fallback
             Set(flight, "MaxSpeed", maxSpeed);
             float peak = 0f;
             for (int f = 0; f < 150; f++)
@@ -74,6 +78,7 @@ namespace UAVSim.Tests.PlayMode
             yield return Fly(DefaultDrone());
             ClearSky();
             SetMode("PosCtl");
+            ForcePosMode(3); // acceptance check 8: the MPC_POS_MODE 3 fallback
             Set(flight, "MaxSpeed", 1f);
             for (int f = 0; f < 200; f++)
             {
@@ -130,6 +135,7 @@ namespace UAVSim.Tests.PlayMode
 
             // Keyboard: forward 0.5 is a speed; the drone ends level at that speed.
             SetMode("PosCtl");
+            ForcePosMode(3); // acceptance check 8: the MPC_POS_MODE 3 fallback
             float sum = 0f; int n = 0;
             for (int f = 0; f < 300; f++)
             {

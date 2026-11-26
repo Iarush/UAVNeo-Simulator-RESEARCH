@@ -60,6 +60,7 @@ public static class FlightConfig
         { "MPC_ACC_DOWN_MAX", 3.0f },
         { "MPC_JERK_MAX", 8.0f },
         { "MPC_TILTMAX_AIR", 45f },
+        { "MPC_MAN_TILT_MAX", 15f },
         { "MPC_MAN_Y_MAX", 150f },
         { "MPC_POS_MODE", 4f },
         { "MPC_XY_P", 0.95f },
@@ -97,6 +98,8 @@ public static class FlightConfig
         { "stabilityRollPitchMax", 3300f },
         { "stabilityYawMin", 2f },
         { "stabilityYawMax", 23000f },
+        { "rotorDragCoeff", 8.06428e-05f },
+        { "rotorDragMotorConstant", 8.54858e-06f },
     };
 
     [Serializable]
