@@ -439,6 +439,14 @@ namespace UAVSim.Tests.PlayMode
             // Yaw makes the diagonal motor pairs run at different speeds, so a prop driven by the
             // wrong motor shows up. Drone.DefaultFlightUpdate rewrites YawSpeed from input every
             // Update, so set it after Update; the next frame's FixedUpdate uses it.
+            //
+            // No minimum split between the diagonal pairs is required. Since the PX4 rate loop
+            // (real-flight-physics phase 1) a steady yaw needs little torque, so the split is only
+            // a few percent (3.7-6.4 % measured), not the 30 % this test used to demand. The guard
+            // that the test can tell the motors apart is the swapped-mapping residual instead: it
+            // must stay well above the 0.5 deg tolerance. It grows with the frame time, so it is
+            // measured at 1/60 s (about 300 deg of prop turn per frame). The direction check needs
+            // under 180 deg per frame, so it runs in a separate pass at 1/240 s.
             Time.captureDeltaTime = 1f / 240f;
             for (int f = 0; f < 60; f++)
             {
@@ -446,20 +454,26 @@ namespace UAVSim.Tests.PlayMode
                 yield return null;
             }
 
-            var stats = new SpinStats();
-            yield return MeasureSpin(60, stats, checkSign: true, yaw: 1f);
+            var fast = new SpinStats();
+            yield return MeasureSpin(60, fast, checkSign: true, yaw: 1f);
+            const float slowDt = 1f / 60f;
+            Time.captureDeltaTime = slowDt;
+            var slow = new SpinStats();
+            yield return MeasureSpin(30, slow, checkSign: false, yaw: 1f);
             Time.captureDeltaTime = 0f;
             Set(flight, "YawSpeed", 0f);
 
             var speeds = (float[])Get(flight, "MotorSpeeds");
             // Yaw torque comes from the diagonal pairs (FR+BL vs FL+BR) running at different speeds.
             float spread = (speeds[0] + speeds[2]) / (speeds[1] + speeds[3]);
-            Report($"yaw: motors FR {speeds[0]:F1} FL {speeds[1]:F1} BL {speeds[2]:F1} BR {speeds[3]:F1} rad/s; " +
-                   $"residual {stats.MaxResidual:F3} deg; with FL/FR swapped it would be {stats.MaxSwappedResidual:F3} deg");
-            Assert.Greater(Mathf.Abs(spread - 1f), 0.3f, "Yaw did not split the motor speeds; test cannot tell motors apart");
-            Assert.AreEqual(0, stats.WrongSign);
-            Assert.Less(stats.MaxResidual, 0.5f, "A propeller is not following its own motor");
-            Assert.Greater(stats.MaxSwappedResidual, 5f, "Test is not sensitive to the motor mapping");
+            float maxResidual = Mathf.Max(fast.MaxResidual, slow.MaxResidual);
+            Report($"yaw: motors FR {speeds[0]:F1} FL {speeds[1]:F1} BL {speeds[2]:F1} BR {speeds[3]:F1} rad/s, " +
+                   $"diagonal split {Mathf.Abs(spread - 1f) * 100f:F1} %; residual {fast.MaxResidual:F3} deg at 1/240 s, " +
+                   $"{slow.MaxResidual:F3} deg at dt {slow.MinDt:F4}-{slow.MaxDt:F4} s; with FL/FR swapped it would be " +
+                   $"{slow.MaxSwappedResidual:F3} deg at that dt; wrong-direction frames {fast.WrongSign}");
+            Assert.AreEqual(0, fast.WrongSign, "A propeller turned the wrong way during yaw");
+            Assert.Less(maxResidual, 0.5f, "A propeller is not following its own motor");
+            Assert.Greater(slow.MaxSwappedResidual, 5f, "Test is not sensitive to the motor mapping");
         }
 
         #endregion

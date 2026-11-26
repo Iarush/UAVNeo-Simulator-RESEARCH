@@ -48,6 +48,12 @@ implement custom `.stl` drone import:
 
 ---
 
+## 2026-11-26 — 7-inch yaw propeller test: sensitivity guard
+
+- `Drone7InchTests.Propellers_FollowTheirOwnMotor_DuringYaw` (owner-approved, test file only) no longer requires a 30 % diagonal motor split: under the PX4 rate loop a steady yaw splits the pairs by only a few percent. The sensitivity guard is now the FL/FR-swapped residual (> 5°), measured in a second pass at 1/60 s. The wrong-direction check stays at 1/240 s, because at 1/60 s a propeller turns about 300° per frame, and the signed-angle check needs less than 180°. Result: Drone7InchTests 6/6 passed. Yaw motors FR 907.3, FL 852.1, BL 922.2, BR 867.9 rad/s (split 6.4 %); residual 0.000° at both frame times; swapped residual 18.402° at 1/60 s; 0 wrong-direction frames.
+
+---
+
 ## 2026-11-22 — Real flight physics, phase 6 (POSCTL yaw reversal, 15° tilt limit, rotor drag)
 
 Spec: `.plans/posctl-yaw-reversal-spec.md` (owner interview 2026-11-22, run to the end without approval stops).
